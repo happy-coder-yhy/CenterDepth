@@ -29,8 +29,7 @@ stereo_center/
 │   ├── run_pipeline.py   # 单帧运行脚本
 │   └── download_weights.sh
 ├── third_party/s2m2/     # S²M² 官方仓库（vendored）
-├── weights/pretrain_weights/CH128NTR1.pth  # S 轻量权重
-└── outputs/              # 运行结果
+└── weights/pretrain_weights/CH128NTR1.pth  # S 轻量权重（仓库根目录，gitignore）
 ```
 
 ## 环境准备（当前目录）
@@ -45,6 +44,15 @@ stereo_center/
 # 下载轻量权重（S 版）
 ./stereo_center/scripts/download_weights.sh
 ```
+
+权重统一放在**仓库根目录** `weights/pretrain_weights/` 下（已在 `.gitignore`
+中，不会上传 GitHub）。脚本解析顺序：
+`--weights` 参数 > 环境变量 `S2M2_WEIGHTS_DIR` > 仓库根 `weights/pretrain_weights`
+> 旧路径 `stereo_center/weights/pretrain_weights`。
+
+> **服务器部署**：clone 到 `~/BothEyesDepth/CenterDepth` 后，把权重放到
+> `CenterDepth/weights/pretrain_weights/`（或设置 `S2M2_WEIGHTS_DIR`），
+> 即可直接运行，无需修改代码。
 
 ## 运行
 
