@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -132,6 +133,25 @@ def main() -> None:
         f"[center] 有效像素占比 {valid_frac:.1%}，深度范围 "
         f"{d_valid.min():.2f}~{d_valid.max():.2f} m (均值 {d_valid.mean():.2f})"
     )
+
+    # 6) 统计信息（JSON）
+    stats = {
+        "model_type": args.model_type,
+        "num_refine": args.num_refine,
+        "device": args.device,
+        "frame": args.frame,
+        "scale": args.scale,
+        "s2m2_inference_seconds": round(res.elapsed_s2m2, 3),
+        "mean_confidence": round(float(conf.mean()), 4),
+        "valid_pixel_fraction": round(float(valid_frac), 4),
+        "depth_min_m": round(float(d_valid.min()), 4),
+        "depth_max_m": round(float(d_valid.max()), 4),
+        "depth_mean_m": round(float(d_valid.mean()), 4),
+        "depth_median_m": round(float(np.median(d_valid)), 4),
+    }
+    with open(outdir / "stats.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    print(f"[stats] 已写入 {outdir / 'stats.json'}")
     print(f"[out] 结果已保存到 {outdir}")
 
 
