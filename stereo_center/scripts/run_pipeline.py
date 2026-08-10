@@ -20,8 +20,9 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_ROOT.parent  # 仓库根目录（clone 后的 CenterDepth/）
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from stereo_center import calib, pipeline, s2m2_inference  # noqa: E402
 from stereo_center.visualize import colorize_depth, colorize_map, make_overview  # noqa: E402
