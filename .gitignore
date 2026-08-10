@@ -1,0 +1,10 @@
+.venv/
+.idea/
+.DS_Store
+docs/
+vdego_amvio_v6_h264
+vdego-c2-48b749_2026-07-28_10-27-26_30fps
+weights/
+说明文档链接.txt
+stereo_center/outputs/
+__pycache__
