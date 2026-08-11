@@ -26,7 +26,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from stereo_center import calib, pointcloud, s2m2_inference  # noqa: E402
+from stereo_center import calib, pointcloud, pytorch3d_rasterizer, s2m2_inference  # noqa: E402
 
 
 def main() -> None:
@@ -46,6 +46,11 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=500_000, help="点云下采样上限")
     parser.add_argument("--stride", type=int, default=2, help="深度图采样步长（>1 减少点数）")
     parser.add_argument("--z-max", type=float, default=10.0, help="可视化深度截断（米）")
+    parser.add_argument(
+        "--backend", type=str, default="auto", choices=["auto", "pytorch3d", "fallback"],
+        help="渲染后端：pytorch3d / fallback（纯 numpy z-buffer）",
+    )
+    parser.add_argument("--radius-px", type=int, default=1, help="点半径（像素）")
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -108,13 +113,18 @@ def main() -> None:
     print(f"[cloud] 点数 {len(pts)}（左 {len(ptsL)} + 右 {len(ptsR)}）")
 
     # 中心虚拟相机（中点，cam_tx = B/2）z-buffer 渲染
-    center_rgb, center_depth = pointcloud.render_zbuffer(
-        pts, col, fx, fy, cx, cy, H, W, cam_tx=B / 2.0
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    backend = args.backend
+    if backend == "auto":
+        backend = "pytorch3d" if pytorch3d_rasterizer.pytorch3d_available() else "fallback"
+    print(f"[render] 后端: {backend}")
+    center_rgb, center_depth, center_valid = pytorch3d_rasterizer.render_center_view(
+        pts, col, K, H, W, cam_tx=B / 2.0,
+        radius_px=args.radius_px, device=args.device, backend=backend,
     )
-    valid = center_depth > 0
     print(
-        f"[center] 有效像素 {valid.mean():.1%}，深度 "
-        f"{center_depth[valid].min():.2f}~{center_depth[valid].max():.2f} m"
+        f"[center] 有效像素 {center_valid.mean():.1%}，深度 "
+        f"{center_depth[center_valid].min():.2f}~{center_depth[center_valid].max():.2f} m"
     )
 
     # 保存
@@ -124,16 +134,17 @@ def main() -> None:
     np.savez(str(outdir / "pointcloud.npz"), points=pts, colors=col)
     pointcloud.save_ply(pts, col, outdir / "pointcloud.ply")
     pointcloud.visualize_pointcloud(pts, col, outdir / "pointcloud_3d.png", z_max=args.z_max)
-    cv2.imwrite(str(outdir / "center_depth.png"), pointcloud_depth_png(center_depth, valid))
+    cv2.imwrite(str(outdir / "center_depth.png"), pointcloud_depth_png(center_depth, center_valid))
 
     stats = {
         "frame": args.frame,
         "scale": args.scale,
         "model_type": args.model_type,
+        "render_backend": backend,
         "num_points": int(len(pts)),
-        "valid_pixel_fraction": round(float(valid.mean()), 4),
-        "depth_min_m": round(float(center_depth[valid].min()), 4),
-        "depth_max_m": round(float(center_depth[valid].max()), 4),
+        "valid_pixel_fraction": round(float(center_valid.mean()), 4),
+        "depth_min_m": round(float(center_depth[center_valid].min()), 4),
+        "depth_max_m": round(float(center_depth[center_valid].max()), 4),
         "s2m2_inference_seconds": round(t1 + t2, 3),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
