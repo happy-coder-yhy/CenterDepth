@@ -139,6 +139,7 @@ def main() -> None:
             "median_k": 0,
             "fill_holes": False,
             "blend": "softavg",
+            "color_tol": 25.0,
         }
     else:
         fusion = dict(pipeline.DEFAULT_FUSION)
