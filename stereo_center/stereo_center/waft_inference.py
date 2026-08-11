@@ -215,16 +215,24 @@ def run_stereo_matching(
 
     need_r = (occ_mode == "lr") or (conf_mode == "lr")
     if need_r:
-        out_r, t2 = _run_once(model, rt, lt, hiera_mode, use_amp)
+        # 正值约束模型：右参考必须水平翻转+交换输入，否则 dR 为半尺度垃圾值
+        out_r, t2 = _run_once(
+            model,
+            torch.flip(rt, dims=[3]),
+            torch.flip(lt, dims=[3]),
+            hiera_mode,
+            use_amp,
+        )
+        dR = torch.flip(out_r["disp_pred"], dims=[2])  # 翻回原右图坐标
         elapsed = t1 + t2
     else:
         elapsed = t1
     if occ_mode == "lr":
-        occ = _lr_consistency_mask(disp, out_r["disp_pred"], H, W)
+        occ = _lr_consistency_mask(disp, dR, H, W)
     else:
         occ = _visibility_mask(disp, H, W)
     if conf_mode == "lr":
-        conf = _lr_confidence(disp, out_r["disp_pred"], H, W)
+        conf = _lr_confidence(disp, dR, H, W)
     else:
         conf = _conf_from_info(info, conf_mode, disp)
 
