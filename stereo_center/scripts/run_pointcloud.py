@@ -50,7 +50,7 @@ def main() -> None:
         "--backend", type=str, default="auto", choices=["auto", "pytorch3d", "fallback"],
         help="渲染后端：pytorch3d / fallback（纯 numpy z-buffer）",
     )
-    parser.add_argument("--radius-px", type=int, default=1, help="点半径（像素）")
+    parser.add_argument("--radius-px", type=int, default=2, help="点半径（像素）")
     args = parser.parse_args()
 
     outdir = Path(args.outdir)

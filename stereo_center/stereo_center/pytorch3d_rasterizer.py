@@ -84,25 +84,29 @@ def _render_pytorch3d(
     )
     from pytorch3d.structures import Pointclouds
 
-    pts = torch.from_numpy(points).float().to(device)
-    col = torch.from_numpy(colors).float().to(device)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    focal = torch.tensor([[fx, fy]], device=device, dtype=torch.float32)
-    principal = torch.tensor([[cx, cy]], device=device, dtype=torch.float32)
-    R = torch.eye(3, device=device)[None]
-    T = torch.tensor([[-cam_tx, 0.0, 0.0]], device=device)  # world -> center cam
+    # PyTorch3D 相机坐标系为 +X 左、+Y 上（与图像坐标相反），故 X/Y 取负；
+    # 同时把投影主点移到图像中心，避免 NDC 视锥外（|x|>1）点被裁剪
+    shift_x = cx - W / 2.0
+    shift_y = cy - H / 2.0
+    Z = points[:, 2]
+    X_cam = points[:, 0] - cam_tx
+    X = -(X_cam + shift_x * Z / fx)
+    Y = -(points[:, 1] + shift_y * Z / fy)
+    pts_cam = np.stack([X, Y, Z], axis=1)
+    pts = torch.from_numpy(pts_cam).float().to(device)
+    feat = torch.from_numpy(colors).float().to(device)
 
     cameras = PerspectiveCameras(
-        R=R,
-        T=T,
-        focal_length=focal,
-        principal_point=principal,
+        R=torch.eye(3, device=device)[None],
+        T=torch.zeros(1, 3, device=device),
+        focal_length=torch.tensor([[fx, fy]], device=device, dtype=torch.float32),
+        principal_point=torch.tensor([[W / 2.0, H / 2.0]], device=device, dtype=torch.float32),
         image_size=((H, W),),
         in_ndc=False,
         device=device,
     )
-    # radius 为 NDC 单位；1 像素 ≈ 2/W，乘系数略放大以覆盖亚像素间隙
-    radius_ndc = (radius_px + 0.5) / (W / 2.0)
+    radius_ndc = 2.0 * radius_px / W  # 像素 -> NDC
     raster_settings = PointsRasterizationSettings(
         image_size=(H, W),
         radius=radius_ndc,
@@ -110,15 +114,16 @@ def _render_pytorch3d(
         bin_size=None,
     )
     rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
-    fragments = rasterizer(Pointclouds(points=[pts], features=[col]))
+    fragments = rasterizer(Pointclouds(points=[pts], features=[feat]))
 
     idx = fragments.idx[0]  # (H, W, points_per_pixel)
     nearest = idx[..., 0]
     valid = nearest >= 0
     rgb = torch.zeros(H, W, 3, device=device)
     dep = torch.zeros(H, W, device=device)
-    rgb[valid] = col[nearest[valid]] * 255.0
-    dep[valid] = pts[nearest[valid], 2]  # 世界 Z == 中心相机 Z（仅沿 X 平移）
+    rgb[valid] = feat[nearest[valid]] * 255.0
+    # 米制深度：直接取最近点的世界 Z（zbuf 是 NDC 深度，不可直接用作米制）
+    dep[valid] = torch.from_numpy(points[:, 2]).float().to(device)[nearest[valid]]
     return (
         rgb.cpu().numpy().astype(np.float32),
         dep.cpu().numpy().astype(np.float32),
