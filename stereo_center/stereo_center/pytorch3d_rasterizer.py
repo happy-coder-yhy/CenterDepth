@@ -87,8 +87,8 @@ def _render_pytorch3d(
     pts = torch.from_numpy(points).float().to(device)
     col = torch.from_numpy(colors).float().to(device)
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    focal = torch.tensor([[fx, fy]], device=device)
-    principal = torch.tensor([[cx, cy]], device=device)
+    focal = torch.tensor([[fx, fy]], device=device, dtype=torch.float32)
+    principal = torch.tensor([[cx, cy]], device=device, dtype=torch.float32)
     R = torch.eye(3, device=device)[None]
     T = torch.tensor([[-cam_tx, 0.0, 0.0]], device=device)  # world -> center cam
 
