@@ -86,12 +86,20 @@ def _render_pytorch3d(
 
     pts = torch.from_numpy(points).float().to(device)
     col = torch.from_numpy(colors).float().to(device)
-    K_t = torch.from_numpy(K).float().to(device)[None]
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    focal = torch.tensor([[fx, fy]], device=device)
+    principal = torch.tensor([[cx, cy]], device=device)
     R = torch.eye(3, device=device)[None]
     T = torch.tensor([[-cam_tx, 0.0, 0.0]], device=device)  # world -> center cam
 
     cameras = PerspectiveCameras(
-        R=R, T=T, K=K_t, image_size=((H, W),), in_ndc=False, device=device
+        R=R,
+        T=T,
+        focal_length=focal,
+        principal_point=principal,
+        image_size=((H, W),),
+        in_ndc=False,
+        device=device,
     )
     # radius 为 NDC 单位；1 像素 ≈ 2/W，乘系数略放大以覆盖亚像素间隙
     radius_ndc = (radius_px + 0.5) / (W / 2.0)
