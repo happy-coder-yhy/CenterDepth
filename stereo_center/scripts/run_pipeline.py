@@ -101,7 +101,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fusion-median-k", type=int, default=None,
-        help="覆盖融合选项：视差中值滤波核，0/1=关（improved 默认 3）",
+        help="覆盖融合选项：视差中值滤波核，0/1=关（improved 默认 0）",
     )
     parser.add_argument(
         "--fusion-fill", type=int, default=None, choices=[0, 1],
@@ -245,6 +245,8 @@ def main() -> None:
         "depth_max_m": round(float(d_valid.max()), 4),
         "depth_mean_m": round(float(d_valid.mean()), 4),
         "depth_median_m": round(float(np.median(d_valid)), 4),
+        "fusion_ambiguity": round(res.fusion_ambiguity, 3),
+        "fusion_single_fraction": round(res.fusion_single_fraction, 5),
     }
     if backend == "waft":
         stats.update(

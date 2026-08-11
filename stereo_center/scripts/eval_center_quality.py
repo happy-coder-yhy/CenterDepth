@@ -84,8 +84,10 @@ def reproject_consistency(
         map_y = np.clip(yy, 0, H - 1).astype(np.float32)
         return cv2.remap(src, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
-    syn_l = sample(rect_left, disp / 2.0)
-    syn_r = sample(rect_right, -disp / 2.0)
+    # 中心图 C(t)：左内容 C(t)=L(t+d/2)，右内容 C(t)=R(t-d/2)
+    # 反投影：L(p)=C(p-d/2)，R(p)=C(p+d/2)
+    syn_l = sample(rect_left, -disp / 2.0)
+    syn_r = sample(rect_right, disp / 2.0)
     res = {}
     for name, syn, ref in (
         ("left", syn_l, rect_left),

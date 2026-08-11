@@ -219,8 +219,10 @@ def run_stereo_matching_bi(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """双向视差推理（左右参考各一次前向）。
 
-    与 run_stereo_matching(occ_mode="lr") 的两次前向等价，但额外返回
-    右参考视差/遮挡/置信度，供中心视角融合直接使用真实 dR。
+    WAFT 等正值约束模型直接交换 (right, left) 输入会得到错误的半尺度视差
+    （实测 dR≈dL/2、LR 一致性 ~1%）；正确做法是水平翻转两张图后再交换
+    输入，让视差恢复为正，最后把输出翻回原坐标。
+    与 run_stereo_matching(occ_mode="lr") 同样两次前向，额外返回真实 dR。
 
     Returns:
         (dL, dR, occL, occR, confL, confR, elapsed)，均为 (H, W) float32 CPU。
@@ -237,17 +239,24 @@ def run_stereo_matching_bi(
     lt = left.to(device)
     rt = right.to(device)
     out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
-    out_r, t2 = _run_once(model, rt, lt, hiera_mode, use_amp)
+    out_r, t2 = _run_once(
+        model,
+        torch.flip(rt, dims=[3]),
+        torch.flip(lt, dims=[3]),
+        hiera_mode,
+        use_amp,
+    )
     dL = out_l["disp_pred"]
-    dR = out_r["disp_pred"]
+    dR = torch.flip(out_r["disp_pred"], dims=[2])  # (B, H, W)，翻回原右图坐标
     if occ_mode == "visibility":
         occL = _visibility_mask(dL, H, W)
         occR = _visibility_mask(dR, H, W)
     else:
         occL = _lr_consistency_mask(dL, dR, H, W)
         occR = _lr_consistency_mask(dR, dL, H, W)
+    infoR = torch.flip(out_r["delta_info_preds"][-1], dims=[3])  # (B, 4, H, W)
     confL = _conf_from_info(out_l["delta_info_preds"][-1], conf_mode, dL)
-    confR = _conf_from_info(out_r["delta_info_preds"][-1], conf_mode, dR)
+    confR = _conf_from_info(infoR, conf_mode, dR)
     return (
         dL[0].float().cpu(),
         dR[0].float().cpu(),

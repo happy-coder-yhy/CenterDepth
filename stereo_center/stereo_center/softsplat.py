@@ -82,6 +82,7 @@ def center_view(
     median_k: int = 0,
     blend: str = "softavg",
     depth_tol: float = 0.15,
+    return_warped: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """由校正后双目 + 立体匹配结果合成中心视角 RGB 与深度。
 
@@ -158,6 +159,20 @@ def center_view(
     center_rgb = (w_l * rgb_l + w_r * rgb_r) / wsum.clamp_min(1e-6)
     center_depth = (w_l * dep_l + w_r * dep_r) / wsum.clamp_min(1e-6)
     center_depth = center_depth * valid.to(center_depth.dtype)
+    if return_warped:
+        return (
+            center_rgb,
+            center_depth,
+            valid,
+            {
+                "rgb_l": rgb_l,
+                "rgb_r": rgb_r,
+                "norm_l": norm_l,
+                "norm_r": norm_r,
+                "dep_l": dep_l,
+                "dep_r": dep_r,
+            },
+        )
     return center_rgb, center_depth, valid
 
 

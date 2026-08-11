@@ -14,7 +14,7 @@ DEFAULT_FUSION = {
     "bi": True,           # 双向视差（右参考视差直接推理）
     "photometric": True,  # 融合前右图光度对齐到左图
     "edge_k": 1.5,        # 边缘感知权重系数（0=关）
-    "median_k": 3,        # 视差中值滤波核（0/1=关）
+    "median_k": 0,        # 视差中值滤波核（0/1=关；本地消融显示无益，默认关）
     "fill_holes": True,   # 背景深度遮挡填充
     "blend": "softavg",   # softavg / gate
 }
@@ -33,6 +33,8 @@ class PipelineResult:
     elapsed_s2m2: float
     fx: float  # 校正后焦距（像素）
     baseline: float  # 基线（米）
+    fusion_ambiguity: float  # 融合歧义度：左右 warp 到中心后颜色差异（越低重影越少）
+    fusion_single_fraction: float  # 融合前单视图覆盖占比（遮挡/未对齐区域）
 
 
 def photometric_align_right(
@@ -115,7 +117,7 @@ def process_stereo_pair(
         torch.from_numpy(right_rgb_f).permute(2, 0, 1).float().unsqueeze(0)
     )
 
-    center_rgb, center_depth, valid = softsplat.center_view(
+    center_rgb, center_depth, valid, warp_extra = softsplat.center_view(
         left_t, right_t_f,
         disp.unsqueeze(0).unsqueeze(0),
         conf.unsqueeze(0).unsqueeze(0),
@@ -128,7 +130,22 @@ def process_stereo_pair(
         edge_k=f["edge_k"],
         median_k=f["median_k"],
         blend=f["blend"],
+        return_warped=True,
     )
+
+    # 融合歧义指标（在遮挡填充前计算）：
+    # 两视图深度一致的像素上，左右 warp 颜色的平均差异越小，重影越少
+    eps = 1e-6
+    both = (warp_extra["norm_l"] > eps) & (warp_extra["norm_r"] > eps)
+    dep_l, dep_r = warp_extra["dep_l"], warp_extra["dep_r"]
+    agree = (dep_l - dep_r).abs() <= 0.15 * torch.minimum(dep_l, dep_r).clamp_min(0.1)
+    sel = both & agree
+    if bool(sel.any()):
+        diff = (warp_extra["rgb_l"] - warp_extra["rgb_r"]).abs().mean(dim=1)  # (1,H,W)
+        fusion_ambiguity = float(diff[sel.squeeze(1)].mean())
+    else:
+        fusion_ambiguity = 0.0
+    fusion_single_fraction = float((valid & ~both).float().mean())
 
     center_rgb_np = (
         center_rgb[0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).numpy()
@@ -152,4 +169,6 @@ def process_stereo_pair(
         elapsed_s2m2=elapsed,
         fx=rect["fx"],
         baseline=rect["baseline"],
+        fusion_ambiguity=fusion_ambiguity,
+        fusion_single_fraction=fusion_single_fraction,
     )

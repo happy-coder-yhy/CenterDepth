@@ -91,9 +91,22 @@ def run_stereo_matching_bi(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """双向视差推理：左右参考各一次 forward。
 
+    注意：S²M² 为正值约束模型，直接交换输入得到的右参考视差不可靠
+    （实测 confR≈0）；这里用"水平翻转 + 交换输入"让视差恢复为正，
+    再把输出翻回原坐标，得到可信的右参考视差。
+
     Returns:
         (dL, dR, occL, occR, confL, confR, elapsed)，均为 (H, W) float32 CPU。
     """
     dL, occL, confL, t1 = run_stereo_matching(model, left, right, device, use_amp)
-    dR, occR, confR, t2 = run_stereo_matching(model, right, left, device, use_amp)
+    dR_f, occR_f, confR_f, t2 = run_stereo_matching(
+        model,
+        torch.flip(right, dims=[3]),
+        torch.flip(left, dims=[3]),
+        device,
+        use_amp,
+    )
+    dR = torch.flip(dR_f, dims=[1])  # (H, W)，翻回原右图坐标
+    occR = torch.flip(occR_f, dims=[1])
+    confR = torch.flip(confR_f, dims=[1])
     return dL, dR, occL, occR, confL, confR, t1 + t2
