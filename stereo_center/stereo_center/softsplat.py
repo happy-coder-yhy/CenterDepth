@@ -82,6 +82,7 @@ def center_view(
     median_k: int = 0,
     blend: str = "softavg",
     depth_tol: float = 0.15,
+    color_tol: float = 25.0,
     return_warped: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """由校正后双目 + 立体匹配结果合成中心视角 RGB 与深度。
@@ -101,9 +102,11 @@ def center_view(
         edge_k: 边缘感知权重系数（0 关闭；>0 时 |∇d| 大的源像素降权）。
         median_k: 视差中值滤波核（0/1 关闭，建议 3）。
         blend: softavg=置信度加权软平均；gate=深度一致性门控（不一致时只保留
-               更近一侧）；hybrid=RGB 用软平均、Depth 用门控选近（默认推荐，
-               兼顾 RGB 观感与深度边缘质量）。
+               更近一侧）；hybrid=RGB 用软平均、Depth 用门控选近；conflict=
+               软平均 + 冲突抑制（两视图深度或颜色差异大时平滑切换为单视图，
+               消除近距离双影）。
         depth_tol: blend=gate 时的相对深度容差。
+        color_tol: blend=conflict 时的颜色冲突阈值（两 warp 平均色差，0-255）。
 
     Returns:
         center_rgb: (1, 3, H, W) 中心 RGB；
@@ -145,7 +148,7 @@ def center_view(
         dep_r, _, _ = softmax_splatting(depth_right, flow_r, ones)
 
     # ---- 融合 ----
-    if blend in ("gate", "hybrid"):
+    if blend in ("gate", "hybrid", "conflict"):
         both = valid_l & valid_r
         agree = (dep_l - dep_r).abs() <= depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1)
         closer_l = dep_l <= dep_r
@@ -154,10 +157,27 @@ def center_view(
         if blend == "gate":
             w_l_rgb = w_l_dep = norm_l * keep_l.to(norm_l.dtype)
             w_r_rgb = w_r_dep = norm_r * keep_r.to(norm_r.dtype)
-        else:  # hybrid：RGB 软平均，Depth 门控选近
+        elif blend == "hybrid":  # RGB 软平均，Depth 门控选近
             w_l_rgb, w_r_rgb = norm_l, norm_r
             w_l_dep = norm_l * keep_l.to(norm_l.dtype)
             w_r_dep = norm_r * keep_r.to(norm_r.dtype)
+        else:  # conflict：深度/颜色冲突处平滑切换为更近的单视图
+            dconf = (
+                (dep_l - dep_r).abs()
+                / (depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1))
+                - 1.0
+            ).clamp(0.0, 1.0)
+            cdiff = (rgb_l - rgb_r).abs().mean(dim=1, keepdim=True)
+            cconf = ((cdiff - color_tol) / max(color_tol, 1e-3)).clamp(0.0, 1.0)
+            conflict = torch.maximum(dconf, cconf)
+            prefer_l = closer_l
+            w_l = norm_l * (1.0 - conflict * (~prefer_l).to(norm_l.dtype))
+            w_r = norm_r * (1.0 - conflict * prefer_l.to(norm_r.dtype))
+            # 只有两视图都覆盖时才做冲突抑制，单视图区域保持原贡献
+            w_l = torch.where(both, w_l, norm_l)
+            w_r = torch.where(both, w_r, norm_r)
+            w_l_rgb = w_l_dep = w_l
+            w_r_rgb = w_r_dep = w_r
     else:  # softavg
         w_l_rgb = w_l_dep = norm_l
         w_r_rgb = w_r_dep = norm_r

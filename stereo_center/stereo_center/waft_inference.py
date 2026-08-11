@@ -112,10 +112,10 @@ def _visibility_mask(disp: torch.Tensor, H: int, W: int) -> torch.Tensor:
     return (xx - disp[0] >= 0).float()
 
 
-def _lr_consistency_mask(
+def _lr_error(
     disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
-) -> torch.Tensor:
-    """左右一致性：|dL - dR(x-dL)| < max(1.0, 5% * dL) 且 x-dL >= 0。"""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """左右一致性误差 |dL - dR(x-dL)| 与右图内坐标 x-dL。"""
     dL = disp_l[0]
     dR = disp_r[0]
     yy, xx = torch.meshgrid(
@@ -136,8 +136,28 @@ def _lr_consistency_mask(
         align_corners=True,
     )[0, 0]
     diff = (dL - dR_at_l).abs()
+    return diff, xx - dL
+
+
+def _lr_consistency_mask(
+    disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
+) -> torch.Tensor:
+    """左右一致性：|dL - dR(x-dL)| < max(1.0, 5% * dL) 且 x-dL >= 0。"""
+    diff, tx = _lr_error(disp_l, disp_r, H, W)
+    dL = disp_l[0]
     thresh = torch.maximum(torch.full_like(dL, 1.0), 0.05 * dL)
-    return ((diff < thresh) & (xx - dL >= 0)).float()
+    return ((diff < thresh) & (tx >= 0)).float()
+
+
+def _lr_confidence(
+    disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
+) -> torch.Tensor:
+    """平滑的左右一致性置信度：exp(-err/thresh)，右图外为 0。"""
+    diff, tx = _lr_error(disp_l, disp_r, H, W)
+    dL = disp_l[0]
+    thresh = torch.maximum(torch.full_like(dL, 1.0), 0.05 * dL)
+    conf = torch.exp(-diff / thresh.clamp_min(1e-3))
+    return conf * (tx >= 0).float()
 
 
 def _resolve_hiera(hiera: str, H: int, W: int) -> str:
@@ -182,8 +202,8 @@ def run_stereo_matching(
     hiera_mode = _resolve_hiera(hiera, H, W)
     if hiera_mode not in ("direct", "hiera"):
         raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
-    if conf_mode not in ("info", "ones"):
-        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones）")
+    if conf_mode not in ("info", "ones", "lr"):
+        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones/lr）")
     if occ_mode not in ("lr", "visibility"):
         raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
 
@@ -193,15 +213,20 @@ def run_stereo_matching(
     disp = out_l["disp_pred"]  # (B, H, W)
     info = out_l["delta_info_preds"][-1]  # (B, 4, H, W)
 
-    if occ_mode == "lr":
+    need_r = (occ_mode == "lr") or (conf_mode == "lr")
+    if need_r:
         out_r, t2 = _run_once(model, rt, lt, hiera_mode, use_amp)
-        occ = _lr_consistency_mask(disp, out_r["disp_pred"], H, W)
         elapsed = t1 + t2
     else:
-        occ = _visibility_mask(disp, H, W)
         elapsed = t1
-
-    conf = _conf_from_info(info, conf_mode, disp)
+    if occ_mode == "lr":
+        occ = _lr_consistency_mask(disp, out_r["disp_pred"], H, W)
+    else:
+        occ = _visibility_mask(disp, H, W)
+    if conf_mode == "lr":
+        conf = _lr_confidence(disp, out_r["disp_pred"], H, W)
+    else:
+        conf = _conf_from_info(info, conf_mode, disp)
 
     return disp[0].float().cpu(), occ.float().cpu(), conf.float().cpu(), elapsed
 
@@ -231,8 +256,8 @@ def run_stereo_matching_bi(
     hiera_mode = _resolve_hiera(hiera, H, W)
     if hiera_mode not in ("direct", "hiera"):
         raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
-    if conf_mode not in ("info", "ones"):
-        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones）")
+    if conf_mode not in ("info", "ones", "lr"):
+        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones/lr）")
     if occ_mode not in ("lr", "visibility"):
         raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
 
@@ -255,8 +280,12 @@ def run_stereo_matching_bi(
         occL = _lr_consistency_mask(dL, dR, H, W)
         occR = _lr_consistency_mask(dR, dL, H, W)
     infoR = torch.flip(out_r["delta_info_preds"][-1], dims=[3])  # (B, 4, H, W)
-    confL = _conf_from_info(out_l["delta_info_preds"][-1], conf_mode, dL)
-    confR = _conf_from_info(infoR, conf_mode, dR)
+    if conf_mode == "lr":
+        confL = _lr_confidence(dL, dR, H, W)
+        confR = _lr_confidence(dR, dL, H, W)
+    else:
+        confL = _conf_from_info(out_l["delta_info_preds"][-1], conf_mode, dL)
+        confR = _conf_from_info(infoR, conf_mode, dR)
     return (
         dL[0].float().cpu(),
         dR[0].float().cpu(),

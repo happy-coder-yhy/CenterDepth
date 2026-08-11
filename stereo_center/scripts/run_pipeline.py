@@ -76,8 +76,8 @@ def main() -> None:
         help="WAFT 推理模式：auto 在 >1080 时用 0.5->1.0 分层",
     )
     parser.add_argument(
-        "--waft-conf", type=str, default="info", choices=["info", "ones"],
-        help="WAFT 置信度：info=官方 uncertainty 映射；ones=常量 1",
+        "--waft-conf", type=str, default="lr", choices=["info", "ones", "lr"],
+        help="WAFT 置信度：lr=平滑左右一致性（默认，可解释）；info=官方 uncertainty 映射；ones=常量 1",
     )
     parser.add_argument(
         "--waft-occ", type=str, default="lr", choices=["lr", "visibility"],
@@ -108,8 +108,12 @@ def main() -> None:
         help="覆盖融合选项：背景深度遮挡填充（improved 默认 1）",
     )
     parser.add_argument(
-        "--fusion-blend", type=str, default=None, choices=["softavg", "gate", "hybrid"],
-        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控（improved 默认 hybrid）",
+        "--fusion-blend", type=str, default=None, choices=["softavg", "gate", "hybrid", "conflict"],
+        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控；conflict=软平均+冲突抑制（improved 默认 conflict）",
+    )
+    parser.add_argument(
+        "--fusion-color-tol", type=float, default=None,
+        help="覆盖融合选项：conflict 模式颜色冲突阈值（0-255，improved 默认 25）",
     )
     parser.add_argument("--no-pointcloud", action="store_true", help="不输出 3D 点云")
     parser.add_argument("--max-points", type=int, default=300_000, help="点云随机下采样上限")
@@ -150,8 +154,12 @@ def main() -> None:
         fusion["fill_holes"] = bool(args.fusion_fill)
     if args.fusion_blend is not None:
         fusion["blend"] = args.fusion_blend
-    if fusion["blend"] not in ("softavg", "gate", "hybrid"):
-        raise ValueError(f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid）")
+    if args.fusion_color_tol is not None:
+        fusion["color_tol"] = args.fusion_color_tol
+    if fusion["blend"] not in ("softavg", "gate", "hybrid", "conflict"):
+        raise ValueError(
+            f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid/conflict）"
+        )
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +207,8 @@ def main() -> None:
     cv2.imwrite(str(outdir / "rect_left.png"), res.rect_left)
     cv2.imwrite(str(outdir / "rect_right.png"), res.rect_right)
     np.save(str(outdir / "disparity.npy"), res.disp)
+    if res.disp_right is not None:
+        np.save(str(outdir / "disp_right.npy"), res.disp_right)
     np.save(str(outdir / "occlusion.npy"), res.occ)
     np.save(str(outdir / "confidence.npy"), res.conf)
     cv2.imwrite(str(outdir / "disparity.png"), colorize_map(res.disp))
@@ -206,9 +216,14 @@ def main() -> None:
         str(outdir / "occlusion.png"),
         cv2.normalize(res.occ, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
     )
+    # 置信度 PNG 用百分位拉伸显示（避免 info 模式双峰分布导致大片黑色）
+    conf_p1, conf_p99 = np.percentile(res.conf, 1), np.percentile(res.conf, 99)
+    if conf_p99 - conf_p1 < 1e-6:
+        conf_p1, conf_p99 = float(res.conf.min()), float(res.conf.max() + 1e-6)
+    conf_disp = np.clip((res.conf - conf_p1) / (conf_p99 - conf_p1), 0, 1)
     cv2.imwrite(
         str(outdir / "confidence.png"),
-        cv2.normalize(res.conf, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+        (conf_disp * 255).astype(np.uint8),
     )
     cv2.imwrite(str(outdir / "center_rgb.png"), res.center_rgb)
     np.save(str(outdir / "center_depth.npy"), res.center_depth)
@@ -301,6 +316,7 @@ def main() -> None:
             "fusion_median_k": fusion["median_k"],
             "fusion_fill_holes": int(fusion["fill_holes"]),
             "fusion_blend": fusion["blend"],
+            "fusion_color_tol": fusion["color_tol"],
         }
     )
     with open(outdir / "stats.json", "w", encoding="utf-8") as f:
