@@ -100,8 +100,9 @@ def center_view(
         fx: 校正后焦距（像素）；baseline: 基线（米）。
         edge_k: 边缘感知权重系数（0 关闭；>0 时 |∇d| 大的源像素降权）。
         median_k: 视差中值滤波核（0/1 关闭，建议 3）。
-        blend: softavg=置信度加权软平均（默认）；gate=深度一致性门控
-               （不一致时只保留更近一侧，默认关闭）。
+        blend: softavg=置信度加权软平均；gate=深度一致性门控（不一致时只保留
+               更近一侧）；hybrid=RGB 用软平均、Depth 用门控选近（默认推荐，
+               兼顾 RGB 观感与深度边缘质量）。
         depth_tol: blend=gate 时的相对深度容差。
 
     Returns:
@@ -144,20 +145,27 @@ def center_view(
         dep_r, _, _ = softmax_splatting(depth_right, flow_r, ones)
 
     # ---- 融合 ----
-    if blend == "gate":
+    if blend in ("gate", "hybrid"):
         both = valid_l & valid_r
         agree = (dep_l - dep_r).abs() <= depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1)
         closer_l = dep_l <= dep_r
         keep_l = agree | ~both | closer_l
         keep_r = agree | ~both | (~closer_l)
-        w_l = norm_l * keep_l.to(norm_l.dtype)
-        w_r = norm_r * keep_r.to(norm_r.dtype)
-    else:  # softavg（默认，保持原有行为）
-        w_l, w_r = norm_l, norm_r
-    wsum = w_l + w_r
-    valid = wsum > 1e-6
-    center_rgb = (w_l * rgb_l + w_r * rgb_r) / wsum.clamp_min(1e-6)
-    center_depth = (w_l * dep_l + w_r * dep_r) / wsum.clamp_min(1e-6)
+        if blend == "gate":
+            w_l_rgb = w_l_dep = norm_l * keep_l.to(norm_l.dtype)
+            w_r_rgb = w_r_dep = norm_r * keep_r.to(norm_r.dtype)
+        else:  # hybrid：RGB 软平均，Depth 门控选近
+            w_l_rgb, w_r_rgb = norm_l, norm_r
+            w_l_dep = norm_l * keep_l.to(norm_l.dtype)
+            w_r_dep = norm_r * keep_r.to(norm_r.dtype)
+    else:  # softavg
+        w_l_rgb = w_l_dep = norm_l
+        w_r_rgb = w_r_dep = norm_r
+    wsum_rgb = w_l_rgb + w_r_rgb
+    wsum_dep = w_l_dep + w_r_dep
+    valid = wsum_rgb > 1e-6
+    center_rgb = (w_l_rgb * rgb_l + w_r_rgb * rgb_r) / wsum_rgb.clamp_min(1e-6)
+    center_depth = (w_l_dep * dep_l + w_r_dep * dep_r) / wsum_dep.clamp_min(1e-6)
     center_depth = center_depth * valid.to(center_depth.dtype)
     if return_warped:
         return (

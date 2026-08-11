@@ -25,7 +25,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from stereo_center import calib, pipeline, stereo_backend  # noqa: E402
+from stereo_center import calib, pipeline, pointcloud, stereo_backend  # noqa: E402
 from stereo_center.visualize import colorize_depth, colorize_map, make_overview  # noqa: E402
 
 
@@ -108,9 +108,13 @@ def main() -> None:
         help="覆盖融合选项：背景深度遮挡填充（improved 默认 1）",
     )
     parser.add_argument(
-        "--fusion-blend", type=str, default=None, choices=["softavg", "gate"],
-        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控（improved 默认 softavg）",
+        "--fusion-blend", type=str, default=None, choices=["softavg", "gate", "hybrid"],
+        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控（improved 默认 hybrid）",
     )
+    parser.add_argument("--no-pointcloud", action="store_true", help="不输出 3D 点云")
+    parser.add_argument("--max-points", type=int, default=300_000, help="点云随机下采样上限")
+    parser.add_argument("--stride", type=int, default=2, help="点云深度图采样步长（>1 减少点数）")
+    parser.add_argument("--z-max", type=float, default=10.0, help="3D 点云可视化深度截断（米）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/run_1"))
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
@@ -146,6 +150,8 @@ def main() -> None:
         fusion["fill_holes"] = bool(args.fusion_fill)
     if args.fusion_blend is not None:
         fusion["blend"] = args.fusion_blend
+    if fusion["blend"] not in ("softavg", "gate", "hybrid"):
+        raise ValueError(f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid）")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -208,6 +214,35 @@ def main() -> None:
     np.save(str(outdir / "center_depth.npy"), res.center_depth)
     cv2.imwrite(str(outdir / "center_depth.png"), colorize_depth(res.center_depth, res.center_valid))
 
+    # 5.5) 3D 点云（左+右视差重建，可选）
+    num_points = 0
+    if not args.no_pointcloud:
+        depthL = res.fx * res.baseline / np.maximum(res.disp, 0.5)
+        ptsL, colL = pointcloud.depth_to_pointcloud(
+            res.rect_left, depthL, res.fx, res.fy, res.cx, res.cy,
+            max_points=args.max_points, stride=args.stride,
+        )
+        pts, col = ptsL, colL
+        if res.disp_right is not None:
+            depthR = res.fx * res.baseline / np.maximum(res.disp_right, 0.5)
+            ptsR, colR = pointcloud.depth_to_pointcloud(
+                res.rect_right, depthR, res.fx, res.fy, res.cx, res.cy,
+                max_points=args.max_points, stride=args.stride,
+            )
+            ptsR = pointcloud.transform_right_to_left(ptsR, res.baseline)
+            pts = np.concatenate([pts, ptsR], axis=0)
+            col = np.concatenate([col, colR], axis=0)
+        num_points = int(len(pts))
+        np.savez(str(outdir / "pointcloud.npz"), points=pts, colors=col)
+        pointcloud.save_ply(pts, col, outdir / "pointcloud.ply")
+        try:
+            pointcloud.visualize_pointcloud(
+                pts, col, outdir / "pointcloud_3d.png", z_max=args.z_max
+            )
+        except Exception as exc:  # matplotlib 缺失时不影响主流程
+            print(f"[pointcloud] 3D 可视化跳过（{exc}）")
+        print(f"[pointcloud] {num_points} 点已保存 (ply/npz/png)")
+
     # 5) 总览图：左校正 | 中心RGB | 右校正 / 视差 | 中心深度 | 置信度
     overview = make_overview(
         res.rect_left,
@@ -247,6 +282,7 @@ def main() -> None:
         "depth_median_m": round(float(np.median(d_valid)), 4),
         "fusion_ambiguity": round(res.fusion_ambiguity, 3),
         "fusion_single_fraction": round(res.fusion_single_fraction, 5),
+        "num_points": num_points,
     }
     if backend == "waft":
         stats.update(

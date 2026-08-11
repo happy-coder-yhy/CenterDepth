@@ -16,7 +16,7 @@ DEFAULT_FUSION = {
     "edge_k": 1.5,        # 边缘感知权重系数（0=关）
     "median_k": 0,        # 视差中值滤波核（0/1=关；本地消融显示无益，默认关）
     "fill_holes": True,   # 背景深度遮挡填充
-    "blend": "softavg",   # softavg / gate
+    "blend": "hybrid",    # softavg / gate / hybrid（RGB 软平均 + Depth 门控）
 }
 
 
@@ -32,7 +32,11 @@ class PipelineResult:
     center_valid: np.ndarray  # (H, W) bool
     elapsed_s2m2: float
     fx: float  # 校正后焦距（像素）
+    fy: float  # 校正后焦距 y（像素）
+    cx: float  # 校正后主点 x（像素）
+    cy: float  # 校正后主点 y（像素）
     baseline: float  # 基线（米）
+    disp_right: np.ndarray | None  # 右参考视差（bi 开启时有值）
     fusion_ambiguity: float  # 融合歧义度：左右 warp 到中心后颜色差异（越低重影越少）
     fusion_single_fraction: float  # 融合前单视图覆盖占比（遮挡/未对齐区域）
 
@@ -168,7 +172,13 @@ def process_stereo_pair(
         center_valid=valid_np,
         elapsed_s2m2=elapsed,
         fx=rect["fx"],
+        fy=rect["P1"][1, 1],
+        cx=rect["P1"][0, 2],
+        cy=rect["P1"][1, 2],
         baseline=rect["baseline"],
+        disp_right=(
+            disp_right[0, 0].numpy() if disp_right is not None else None
+        ),
         fusion_ambiguity=fusion_ambiguity,
         fusion_single_fraction=fusion_single_fraction,
     )
