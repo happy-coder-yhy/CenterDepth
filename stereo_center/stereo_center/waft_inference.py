@@ -140,6 +140,21 @@ def _lr_consistency_mask(
     return ((diff < thresh) & (xx - dL >= 0)).float()
 
 
+def _resolve_hiera(hiera: str, H: int, W: int) -> str:
+    """auto：max(H,W)>1080 用 0.5->1.0 分层，否则直接 forward。"""
+    if hiera == "auto":
+        return "hiera" if max(H, W) > 1080 else "direct"
+    return hiera
+
+
+def _conf_from_info(info: torch.Tensor, conf_mode: str, disp: torch.Tensor) -> torch.Tensor:
+    """info：官方 uncertainty 映射 softmax(info[:, :2])[:, 0]；ones：常量 1。"""
+    if conf_mode == "ones":
+        return torch.ones_like(disp[0])
+    weight = info[:, :2].softmax(dim=1)
+    return weight[0, 0]
+
+
 @torch.no_grad()
 def run_stereo_matching(
     model: WAFT,
@@ -164,9 +179,7 @@ def run_stereo_matching(
         elapsed: 推理耗时（秒，lr 模式含双向前向）。
     """
     H, W = left.shape[-2:]
-    hiera_mode = hiera
-    if hiera_mode == "auto":
-        hiera_mode = "hiera" if max(H, W) > 1080 else "direct"
+    hiera_mode = _resolve_hiera(hiera, H, W)
     if hiera_mode not in ("direct", "hiera"):
         raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
     if conf_mode not in ("info", "ones"):
@@ -188,10 +201,59 @@ def run_stereo_matching(
         occ = _visibility_mask(disp, H, W)
         elapsed = t1
 
-    if conf_mode == "ones":
-        conf = torch.ones_like(disp[0])
-    else:
-        weight = info[:, :2].softmax(dim=1)
-        conf = weight[0, 0]
+    conf = _conf_from_info(info, conf_mode, disp)
 
     return disp[0].float().cpu(), occ.float().cpu(), conf.float().cpu(), elapsed
+
+
+@torch.no_grad()
+def run_stereo_matching_bi(
+    model: WAFT,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    device: str = "cuda",
+    use_amp: bool = True,
+    hiera: str = "auto",
+    conf_mode: str = "info",
+    occ_mode: str = "lr",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """双向视差推理（左右参考各一次前向）。
+
+    与 run_stereo_matching(occ_mode="lr") 的两次前向等价，但额外返回
+    右参考视差/遮挡/置信度，供中心视角融合直接使用真实 dR。
+
+    Returns:
+        (dL, dR, occL, occR, confL, confR, elapsed)，均为 (H, W) float32 CPU。
+    """
+    H, W = left.shape[-2:]
+    hiera_mode = _resolve_hiera(hiera, H, W)
+    if hiera_mode not in ("direct", "hiera"):
+        raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
+    if conf_mode not in ("info", "ones"):
+        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones）")
+    if occ_mode not in ("lr", "visibility"):
+        raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
+
+    lt = left.to(device)
+    rt = right.to(device)
+    out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
+    out_r, t2 = _run_once(model, rt, lt, hiera_mode, use_amp)
+    dL = out_l["disp_pred"]
+    dR = out_r["disp_pred"]
+    if occ_mode == "visibility":
+        occL = _visibility_mask(dL, H, W)
+        occR = _visibility_mask(dR, H, W)
+    else:
+        occL = _lr_consistency_mask(dL, dR, H, W)
+        occR = _lr_consistency_mask(dR, dL, H, W)
+    confL = _conf_from_info(out_l["delta_info_preds"][-1], conf_mode, dL)
+    confR = _conf_from_info(out_r["delta_info_preds"][-1], conf_mode, dR)
+    return (
+        dL[0].float().cpu(),
+        dR[0].float().cpu(),
+        occL.float().cpu(),
+        occR.float().cpu(),
+        confL.float().cpu(),
+        confR.float().cpu(),
+        t1 + t2,
+    )

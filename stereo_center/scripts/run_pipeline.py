@@ -83,6 +83,34 @@ def main() -> None:
         "--waft-occ", type=str, default="lr", choices=["lr", "visibility"],
         help="WAFT 遮挡掩码：lr=左右一致性（双向）；visibility=仅可见性（单向）",
     )
+    parser.add_argument(
+        "--fusion", type=str, default="improved", choices=["baseline", "improved"],
+        help="中心视角融合：baseline=旧软平均（单侧视差、无改进）；improved=低成本融合改进",
+    )
+    parser.add_argument(
+        "--fusion-bi", type=int, default=None, choices=[0, 1],
+        help="覆盖融合选项：双向视差（improved 默认 1）",
+    )
+    parser.add_argument(
+        "--fusion-photometric", type=int, default=None, choices=[0, 1],
+        help="覆盖融合选项：光度校正（improved 默认 1）",
+    )
+    parser.add_argument(
+        "--fusion-edge-k", type=float, default=None,
+        help="覆盖融合选项：边缘感知权重系数，0=关（improved 默认 1.5）",
+    )
+    parser.add_argument(
+        "--fusion-median-k", type=int, default=None,
+        help="覆盖融合选项：视差中值滤波核，0/1=关（improved 默认 3）",
+    )
+    parser.add_argument(
+        "--fusion-fill", type=int, default=None, choices=[0, 1],
+        help="覆盖融合选项：背景深度遮挡填充（improved 默认 1）",
+    )
+    parser.add_argument(
+        "--fusion-blend", type=str, default=None, choices=["softavg", "gate"],
+        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控（improved 默认 softavg）",
+    )
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/run_1"))
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
@@ -94,6 +122,30 @@ def main() -> None:
         raise ValueError(
             f"waft 后端不支持模型类型 {args.model_type}（可选 DAv2S-4/DAv2B-4/DAv2L-5）"
         )
+
+    if args.fusion == "baseline":
+        fusion = {
+            "bi": False,
+            "photometric": False,
+            "edge_k": 0.0,
+            "median_k": 0,
+            "fill_holes": False,
+            "blend": "softavg",
+        }
+    else:
+        fusion = dict(pipeline.DEFAULT_FUSION)
+    if args.fusion_bi is not None:
+        fusion["bi"] = bool(args.fusion_bi)
+    if args.fusion_photometric is not None:
+        fusion["photometric"] = bool(args.fusion_photometric)
+    if args.fusion_edge_k is not None:
+        fusion["edge_k"] = args.fusion_edge_k
+    if args.fusion_median_k is not None:
+        fusion["median_k"] = args.fusion_median_k
+    if args.fusion_fill is not None:
+        fusion["fill_holes"] = bool(args.fusion_fill)
+    if args.fusion_blend is not None:
+        fusion["blend"] = args.fusion_blend
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -131,6 +183,7 @@ def main() -> None:
         left_bgr, right_bgr, cal, model,
         device=args.device, scale=args.scale, backend=backend,
         backend_kwargs=backend_kwargs,
+        fusion=fusion,
     )
     print(f"[{backend}] 单帧推理耗时 {res.elapsed_s2m2:.1f} s")
     conf = res.conf[100:-100, 100:-100] if res.conf.shape[0] > 200 else res.conf
@@ -182,6 +235,8 @@ def main() -> None:
         "device": args.device,
         "frame": args.frame,
         "scale": args.scale,
+        "fx": round(res.fx, 3),
+        "baseline": round(res.baseline, 4),
         "stereo_inference_seconds": round(res.elapsed_s2m2, 3),
         "s2m2_inference_seconds": round(res.elapsed_s2m2, 3),
         "mean_confidence": round(float(conf.mean()), 4),
@@ -199,6 +254,17 @@ def main() -> None:
                 "waft_occ": args.waft_occ,
             }
         )
+    stats.update(
+        {
+            "fusion": args.fusion,
+            "fusion_bi": int(fusion["bi"]),
+            "fusion_photometric": int(fusion["photometric"]),
+            "fusion_edge_k": fusion["edge_k"],
+            "fusion_median_k": fusion["median_k"],
+            "fusion_fill_holes": int(fusion["fill_holes"]),
+            "fusion_blend": fusion["blend"],
+        }
+    )
     with open(outdir / "stats.json", "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
     print(f"[stats] 已写入 {outdir / 'stats.json'}")

@@ -79,3 +79,21 @@ def run_stereo_matching(
     occ = image_crop(occ, (H, W)).squeeze().float().cpu()
     conf = image_crop(conf, (H, W)).squeeze().float().cpu()
     return disp, occ, conf, elapsed
+
+
+@torch.no_grad()
+def run_stereo_matching_bi(
+    model: S2M2,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    device: str = "cpu",
+    use_amp: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """双向视差推理：左右参考各一次 forward。
+
+    Returns:
+        (dL, dR, occL, occR, confL, confR, elapsed)，均为 (H, W) float32 CPU。
+    """
+    dL, occL, confL, t1 = run_stereo_matching(model, left, right, device, use_amp)
+    dR, occR, confR, t2 = run_stereo_matching(model, right, left, device, use_amp)
+    return dL, dR, occL, occR, confL, confR, t1 + t2

@@ -50,3 +50,18 @@ def run(backend: str, model, left, right, device: str, **kwargs):
 
         return waft_inference.run_stereo_matching(model, left, right, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")
+
+
+def run_bi(backend: str, model, left, right, device: str, **kwargs):
+    """按后端调用双向推理，返回 (dL, dR, occL, occR, confL, confR, elapsed)。"""
+    if backend == "s2m2":
+        from . import s2m2_inference
+
+        return s2m2_inference.run_stereo_matching_bi(
+            model, left, right, device, use_amp=kwargs.get("use_amp", False)
+        )
+    if backend == "waft":
+        from . import waft_inference
+
+        return waft_inference.run_stereo_matching_bi(model, left, right, device, **kwargs)
+    raise ValueError(f"未知立体匹配后端: {backend}")
