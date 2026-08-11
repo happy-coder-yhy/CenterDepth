@@ -1,4 +1,4 @@
-"""组合管线：双目帧 -> 鱼眼校正 -> S²M² -> SoftSplat -> 中心视角 RGB + Depth。"""
+"""组合管线：双目帧 -> 鱼眼校正 -> 立体匹配（s2m2|waft）-> SoftSplat -> 中心视角 RGB + Depth。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 
-from . import calib, s2m2_inference, softsplat
+from . import calib, softsplat, stereo_backend
 
 
 @dataclass
@@ -31,6 +31,8 @@ def process_stereo_pair(
     model,
     device: str = "cpu",
     scale: float = 0.5,
+    backend: str = "waft",
+    backend_kwargs: dict | None = None,
 ) -> PipelineResult:
     """处理一帧双目图，输出中心视角 RGB + Depth。"""
     out_size = (
@@ -45,8 +47,10 @@ def process_stereo_pair(
     left_t = torch.from_numpy(left_rgb).permute(2, 0, 1).float().unsqueeze(0)
     right_t = torch.from_numpy(right_rgb).permute(2, 0, 1).float().unsqueeze(0)
 
-    disp, occ, conf, elapsed = s2m2_inference.run_stereo_matching(
-        model, left_t, right_t, device
+    mod = stereo_backend.get_backend(backend)
+    kwargs = dict(backend_kwargs or {})
+    disp, occ, conf, elapsed = mod.run_stereo_matching(
+        model, left_t, right_t, device, **kwargs
     )
 
     center_rgb, center_depth, valid = softsplat.center_view(

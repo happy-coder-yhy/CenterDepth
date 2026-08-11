@@ -26,7 +26,25 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from stereo_center import calib, pointcloud, pytorch3d_rasterizer, s2m2_inference  # noqa: E402
+from stereo_center import calib, pointcloud, pytorch3d_rasterizer, stereo_backend  # noqa: E402
+
+
+def resolve_weights_dir(explicit: str | None, backend: str = "s2m2") -> str:
+    """权重目录解析（与 run_pipeline 一致）：--weights > 环境变量 > 仓库根 weights/<backend>/。"""
+    if explicit:
+        return explicit
+    if backend == "waft":
+        env = os.environ.get("WAFT_WEIGHTS_DIR")
+        subdir = "waft"
+    else:
+        env = os.environ.get("S2M2_WEIGHTS_DIR")
+        subdir = "pretrain_weights"
+    if env:
+        return env
+    for cand in (REPO_ROOT / "weights" / subdir, PROJECT_ROOT / "weights" / subdir):
+        if cand.exists():
+            return str(cand)
+    raise FileNotFoundError(f"未找到权重目录（后端 {backend}），请用 --weights 或设置环境变量")
 
 
 def main() -> None:
@@ -35,11 +53,31 @@ def main() -> None:
     parser.add_argument("--calib", type=str, required=True)
     parser.add_argument("--frame", type=int, default=60)
     parser.add_argument("--scale", type=float, default=0.5)
-    parser.add_argument("--model-type", type=str, default="S", choices=["S", "M", "L", "XL"])
+    parser.add_argument(
+        "--stereo-backend", type=str, default="waft", choices=["s2m2", "waft"],
+        help="立体匹配后端（默认 waft；s2m2 可回退）",
+    )
+    parser.add_argument(
+        "--model-type", type=str, default="DAv2L-5",
+        choices=["S", "M", "L", "XL", "DAv2S-4", "DAv2B-4", "DAv2L-5"],
+        help="模型类型：s2m2 用 S/M/L/XL；waft 用 DAv2S-4/DAv2B-4/DAv2L-5",
+    )
     parser.add_argument("--num-refine", type=int, default=3)
     parser.add_argument(
         "--weights", type=str, default=None,
-        help="权重目录（默认：仓库根 weights/pretrain_weights 或 $S2M2_WEIGHTS_DIR）",
+        help="权重目录（默认按后端解析：waft->weights/waft 或 $WAFT_WEIGHTS_DIR）",
+    )
+    parser.add_argument(
+        "--waft-mode", type=str, default="auto", choices=["auto", "direct", "hiera"],
+        help="WAFT 推理模式：auto 在 >1080 时用 0.5->1.0 分层",
+    )
+    parser.add_argument(
+        "--disp-left-npy", type=str, default=None,
+        help="复用已保存的左视差 npy（跳过立体匹配；与 waft 环境解耦）",
+    )
+    parser.add_argument(
+        "--disp-right-npy", type=str, default=None,
+        help="复用已保存的右视差 npy（跳过立体匹配；与 waft 环境解耦）",
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/pointcloud"))
@@ -55,19 +93,6 @@ def main() -> None:
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-
-    # 权重解析（与 run_pipeline 一致）
-    weights_dir = args.weights
-    if not weights_dir:
-        weights_dir = os.environ.get("S2M2_WEIGHTS_DIR")
-    if not weights_dir:
-        for cand in (REPO_ROOT / "weights/pretrain_weights", PROJECT_ROOT / "weights/pretrain_weights"):
-            if cand.exists():
-                weights_dir = str(cand)
-                break
-    if not weights_dir:
-        raise FileNotFoundError("未找到权重目录，请用 --weights 或设置 S2M2_WEIGHTS_DIR")
-    print(f"[weights] 权重目录: {weights_dir}")
 
     # 读帧
     cap = cv2.VideoCapture(args.video)
@@ -90,13 +115,49 @@ def main() -> None:
     B = rect["baseline"]
     print(f"[rect] 校正后 {W}x{H}, fx={fx:.1f}, baseline={B:.4f} m")
 
-    # 双向 S²M²
-    model = s2m2_inference.load_s2m2(args.model_type, weights_dir, args.num_refine, args.device)
-    lt = torch.from_numpy(cv2.cvtColor(rL, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
-    rt = torch.from_numpy(cv2.cvtColor(rR, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
-    dL, _, cL, t1 = s2m2_inference.run_stereo_matching(model, lt, rt, args.device)
-    dR, _, cR, t2 = s2m2_inference.run_stereo_matching(model, rt, lt, args.device)
-    print(f"[s2m2] 双向推理 {t1 + t2:.2f}s")
+    # 双向视差：优先复用 npy（跨环境解耦），否则跑立体匹配后端
+    stereo_name = args.stereo_backend
+    if args.disp_left_npy and args.disp_right_npy:
+        dL = np.load(args.disp_left_npy)
+        dR = np.load(args.disp_right_npy)
+        if dL.shape != (H, W) or dR.shape != (H, W):
+            raise ValueError(
+                f"npy 视差形状 {dL.shape}/{dR.shape} 与校正尺寸 {H}x{W} 不一致"
+            )
+        t1 = t2 = 0.0
+        print(f"[stereo] 复用视差 npy: {args.disp_left_npy}, {args.disp_right_npy}")
+    else:
+        if stereo_name == "s2m2" and args.model_type not in ("S", "M", "L", "XL"):
+            raise ValueError(f"s2m2 后端不支持模型类型 {args.model_type}")
+        if stereo_name == "waft" and args.model_type not in ("DAv2S-4", "DAv2B-4", "DAv2L-5"):
+            raise ValueError(
+                f"waft 后端不支持模型类型 {args.model_type}（可选 DAv2S-4/DAv2B-4/DAv2L-5）"
+            )
+        weights_dir = resolve_weights_dir(args.weights, stereo_name)
+        print(f"[weights] 权重目录: {weights_dir}")
+        model = stereo_backend.load(
+            stereo_name, args.model_type, weights_dir, args.device,
+            num_refine=args.num_refine,
+        )
+        lt = torch.from_numpy(cv2.cvtColor(rL, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
+        rt = torch.from_numpy(cv2.cvtColor(rR, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
+        # 点云路线只需要双向视差：waft 用 visibility 模式避免每个方向重复双向推理
+        backend_kwargs = (
+            {"hiera": args.waft_mode, "conf_mode": "ones", "occ_mode": "visibility"}
+            if stereo_name == "waft"
+            else {}
+        )
+        dL, _, _, t1 = stereo_backend.run(
+            stereo_name, model, lt, rt, args.device, **backend_kwargs
+        )
+        dR, _, _, t2 = stereo_backend.run(
+            stereo_name, model, rt, lt, args.device, **backend_kwargs
+        )
+        print(f"[{stereo_name}] 双向推理 {t1 + t2:.2f}s")
+    dL = np.asarray(dL)
+    dR = np.asarray(dR)
+    np.save(str(outdir / "disp_left.npy"), dL)
+    np.save(str(outdir / "disp_right.npy"), dR)
 
     # 深度 -> 点云
     depthL = fx * B / dL.numpy().clip(min=0.5)
@@ -139,6 +200,7 @@ def main() -> None:
     stats = {
         "frame": args.frame,
         "scale": args.scale,
+        "stereo_backend": stereo_name if not args.disp_left_npy else "npy",
         "model_type": args.model_type,
         "render_backend": backend,
         "num_points": int(len(pts)),
@@ -147,6 +209,8 @@ def main() -> None:
         "depth_max_m": round(float(center_depth[center_valid].max()), 4),
         "s2m2_inference_seconds": round(t1 + t2, 3),
     }
+    if stereo_name == "waft" and not args.disp_left_npy:
+        stats["waft_mode"] = args.waft_mode
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[out] 结果已保存到 {outdir}")
 
