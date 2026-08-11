@@ -109,7 +109,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fusion-blend", type=str, default=None, choices=["softavg", "gate", "hybrid", "conflict"],
-        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控；conflict=软平均+冲突抑制（improved 默认 conflict）",
+        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控；conflict=软平均+冲突抑制（improved 默认 hybrid）",
     )
     parser.add_argument(
         "--fusion-color-tol", type=float, default=None,

@@ -16,7 +16,7 @@ DEFAULT_FUSION = {
     "edge_k": 1.5,        # 边缘感知权重系数（0=关）
     "median_k": 0,        # 视差中值滤波核（0/1=关；本地消融显示无益，默认关）
     "fill_holes": True,   # 背景深度遮挡填充
-    "blend": "conflict",  # softavg / gate / hybrid / conflict（冲突处平滑切单视图，消除双影）
+    "blend": "hybrid",    # softavg / gate / hybrid / conflict（实测 hybrid 观感最佳，默认）
     "color_tol": 25.0,    # conflict 模式的颜色冲突阈值（0-255）
 }
 
