@@ -79,8 +79,8 @@ def _render_pytorch3d(
     import torch
     from pytorch3d.renderer import (
         PerspectiveCameras,
+        PointsRasterizationSettings,
         PointsRasterizer,
-        RasterizationSettings,
     )
     from pytorch3d.structures import Pointclouds
 
@@ -95,7 +95,7 @@ def _render_pytorch3d(
     )
     # radius 为 NDC 单位；1 像素 ≈ 2/W，乘系数略放大以覆盖亚像素间隙
     radius_ndc = (radius_px + 0.5) / (W / 2.0)
-    raster_settings = RasterizationSettings(
+    raster_settings = PointsRasterizationSettings(
         image_size=(H, W),
         radius=radius_ndc,
         points_per_pixel=3,
