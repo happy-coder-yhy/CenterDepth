@@ -79,10 +79,10 @@ def _render_pytorch3d(
     import torch
     from pytorch3d.renderer import (
         PerspectiveCameras,
-        Pointclouds,
         PointsRasterizer,
         RasterizationSettings,
     )
+    from pytorch3d.structures import Pointclouds
 
     pts = torch.from_numpy(points).float().to(device)
     col = torch.from_numpy(colors).float().to(device)
