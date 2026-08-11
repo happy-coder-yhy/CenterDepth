@@ -160,8 +160,8 @@ def main() -> None:
     np.save(str(outdir / "disp_right.npy"), dR)
 
     # 深度 -> 点云
-    depthL = fx * B / dL.numpy().clip(min=0.5)
-    depthR = fx * B / dR.numpy().clip(min=0.5)
+    depthL = fx * B / dL.clip(min=0.5)
+    depthR = fx * B / dR.clip(min=0.5)
     ptsL, colL = pointcloud.depth_to_pointcloud(
         rL, depthL, fx, fy, cx, cy, max_points=args.max_points, stride=args.stride
     )
