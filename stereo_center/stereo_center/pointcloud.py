@@ -160,24 +160,30 @@ def voxel_downsample(
     colors: np.ndarray,
     max_points: int = 2_000_000,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """体素降采样到 <=max_points：每个体素保留一个点，场景覆盖比随机抽样均匀。
+    """体素降采样到 <=max_points：每个体素保留离中心最近的点。
 
-    体素大小按场景包围盒自适应（目标体素数约等于 max_points），
-    若一次降采样后仍超限则逐步放大体素。
+    点云是面填充而非体填充，不能按包围盒体积估算体素尺寸；
+    这里从很小的体素开始逐步放大，直到唯一体素数 <= max_points。
     """
     if len(points) <= max_points:
         return points, colors
     span = np.percentile(points, 98, axis=0) - np.percentile(points, 2, axis=0)
     span = np.maximum(span, 1e-3)
-    voxel_size = float((span.prod() / max_points) ** (1.0 / 3.0))
-    voxel_size = float(np.clip(voxel_size, 1e-4, 0.2))
-    for _ in range(8):
+    voxel_size = float(np.clip(span.min() / 200.0, 1e-4, 0.02))
+    n = len(points)
+    for _ in range(24):
         vox = np.floor(points / voxel_size).astype(np.int64)
-        _, first = np.unique(vox, axis=0, return_index=True)
-        first.sort()
-        if len(first) <= max_points:
-            return points[first], colors[first]
-        voxel_size *= 1.4
+        centers = (vox + 0.5) * voxel_size
+        dist = ((points - centers) ** 2).sum(axis=1)
+        # 按 (体素, 到中心距离) 排序，每个体素保留最近的点
+        order = np.lexsort((dist, vox[:, 0], vox[:, 1], vox[:, 2]))
+        vs = vox[order]
+        keep = np.ones(n, dtype=bool)
+        keep[1:] = (vs[1:] != vs[:-1]).any(axis=1)
+        idx = order[keep]
+        if len(idx) <= max_points:
+            return points[idx], colors[idx]
+        voxel_size *= 1.3
     # 兜底：均匀随机抽样
     idx = np.random.default_rng(0).choice(len(points), max_points, replace=False)
     idx.sort()
