@@ -116,9 +116,9 @@ def main() -> None:
         help="覆盖融合选项：conflict 模式颜色冲突阈值（0-255，improved 默认 25）",
     )
     parser.add_argument("--no-pointcloud", action="store_true", help="不输出 3D 点云")
-    parser.add_argument("--max-points", type=int, default=300_000, help="点云随机下采样上限")
-    parser.add_argument("--stride", type=int, default=2, help="点云深度图采样步长（>1 减少点数）")
-    parser.add_argument("--z-max", type=float, default=10.0, help="3D 点云可视化深度截断（米）")
+    parser.add_argument("--max-points", type=int, default=1_000_000, help="点云体素降采样后点数上限")
+    parser.add_argument("--stride", type=int, default=1, help="点云深度图采样步长（默认 1=全分辨率）")
+    parser.add_argument("--z-max", type=float, default=10.0, help="点云深度过滤/可视化截断（米）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/run_1"))
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
@@ -236,18 +236,21 @@ def main() -> None:
         depthL = res.fx * res.baseline / np.maximum(res.disp, 0.5)
         ptsL, colL = pointcloud.depth_to_pointcloud(
             res.rect_left, depthL, res.fx, res.fy, res.cx, res.cy,
-            max_points=args.max_points, stride=args.stride,
+            max_points=args.max_points * 4, stride=args.stride,
         )
         pts, col = ptsL, colL
         if res.disp_right is not None:
             depthR = res.fx * res.baseline / np.maximum(res.disp_right, 0.5)
             ptsR, colR = pointcloud.depth_to_pointcloud(
                 res.rect_right, depthR, res.fx, res.fy, res.cx, res.cy,
-                max_points=args.max_points, stride=args.stride,
+                max_points=args.max_points * 4, stride=args.stride,
             )
             ptsR = pointcloud.transform_right_to_left(ptsR, res.baseline)
             pts = np.concatenate([pts, ptsR], axis=0)
             col = np.concatenate([col, colR], axis=0)
+        # 深度范围过滤（去死区远噪点）+ 体素降采样（均匀覆盖）
+        pts, col = pointcloud.filter_pointcloud(pts, col, z_min=0.05, z_max=args.z_max)
+        pts, col = pointcloud.voxel_downsample(pts, col, max_points=args.max_points)
         num_points = int(len(pts))
         np.savez(str(outdir / "pointcloud.npz"), points=pts, colors=col)
         pointcloud.save_ply(pts, col, outdir / "pointcloud.ply")
@@ -287,6 +290,9 @@ def main() -> None:
         "frame": args.frame,
         "scale": args.scale,
         "fx": round(res.fx, 3),
+        "fy": round(res.fy, 3),
+        "cx": round(res.cx, 3),
+        "cy": round(res.cy, 3),
         "baseline": round(res.baseline, 4),
         "stereo_inference_seconds": round(res.elapsed_s2m2, 3),
         "s2m2_inference_seconds": round(res.elapsed_s2m2, 3),

@@ -113,24 +113,84 @@ def render_zbuffer(
 
 
 def save_ply(points: np.ndarray, colors: np.ndarray, path: str | Path) -> None:
-    """保存 PLY（ASCII，含 RGB），可用 MeshLab / CloudCompare 打开。"""
+    """保存 PLY（binary_little_endian，含 RGB），体积约为 ASCII 的 1/4。"""
     colors_u8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
-    with open(path, "w", encoding="ascii") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(points)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        for p, c in zip(points, colors_u8):
-            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {c[0]} {c[1]} {c[2]}\n")
+    n = len(points)
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    )
+    verts = np.empty(
+        n,
+        dtype=[
+            ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+            ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+        ],
+    )
+    verts["x"], verts["y"], verts["z"] = points[:, 0], points[:, 1], points[:, 2]
+    verts["red"], verts["green"], verts["blue"] = (
+        colors_u8[:, 0], colors_u8[:, 1], colors_u8[:, 2],
+    )
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        verts.tofile(f)
+
+
+def filter_pointcloud(
+    points: np.ndarray,
+    colors: np.ndarray,
+    z_min: float = 0.05,
+    z_max: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """深度范围过滤：去掉 <z_min 与 >z_max 的不可靠点。
+
+    小基线下远点视差只有亚像素级（30m 处约 0.25px），深度噪声达米级，
+    属于死区/误匹配，应排除以免污染场景。
+    """
+    keep = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+    return points[keep], colors[keep]
+
+
+def voxel_downsample(
+    points: np.ndarray,
+    colors: np.ndarray,
+    max_points: int = 2_000_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """体素降采样到 <=max_points：每个体素保留一个点，场景覆盖比随机抽样均匀。
+
+    体素大小按场景包围盒自适应（目标体素数约等于 max_points），
+    若一次降采样后仍超限则逐步放大体素。
+    """
+    if len(points) <= max_points:
+        return points, colors
+    span = np.percentile(points, 98, axis=0) - np.percentile(points, 2, axis=0)
+    span = np.maximum(span, 1e-3)
+    voxel_size = float((span.prod() / max_points) ** (1.0 / 3.0))
+    voxel_size = float(np.clip(voxel_size, 1e-4, 0.2))
+    for _ in range(8):
+        vox = np.floor(points / voxel_size).astype(np.int64)
+        _, first = np.unique(vox, axis=0, return_index=True)
+        first.sort()
+        if len(first) <= max_points:
+            return points[first], colors[first]
+        voxel_size *= 1.4
+    # 兜底：均匀随机抽样
+    idx = np.random.default_rng(0).choice(len(points), max_points, replace=False)
+    idx.sort()
+    return points[idx], colors[idx]
 
 
 def visualize_pointcloud(
     points: np.ndarray,
     colors: np.ndarray,
     out_path: str | Path,
-    z_max: float = 10.0,
+    z_max: float | None = None,
     title: str = "3D Point Cloud",
+    max_viz_points: int = 400_000,
 ) -> None:
     """用 matplotlib 渲染 3D 点云（三个视角并排），保存 PNG。"""
     import matplotlib
@@ -138,26 +198,33 @@ def visualize_pointcloud(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    keep = points[:, 2] <= z_max
+    if z_max is None:
+        z_max = float(np.percentile(points[:, 2], 98))
+    keep = (points[:, 2] >= 0.02) & (points[:, 2] <= z_max)
     pts = points[keep]
     col = colors[keep]
+    if len(pts) > max_viz_points:  # 可视化抽样，避免 scatter 过慢
+        idx = np.random.default_rng(0).choice(len(pts), max_viz_points, replace=False)
+        idx.sort()
+        pts, col = pts[idx], col[idx]
 
     views = [
         ("front", 0, -90),
         ("perspective", 20, -60),
         ("top", 90, 0),
     ]
+    s = max(0.4, 40.0 / len(pts) ** 0.5)  # 点数多时点变小
     fig = plt.figure(figsize=(18, 6))
     for i, (name, elev, azim) in enumerate(views, 1):
         ax = fig.add_subplot(1, 3, i, projection="3d")
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=col, s=0.6, alpha=0.8)
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=col, s=s, alpha=0.8)
         ax.view_init(elev=elev, azim=azim)
         ax.set_xlabel("X (m)")
         ax.set_ylabel("Y (m)")
         ax.set_zlabel("Z (m)")
         ax.set_title(name)
         # 等比例
-        lims = np.percentile(pts, [1, 99], axis=0)
+        lims = np.percentile(pts, [2, 98], axis=0)
         span = max((lims[1] - lims[0]).max() / 2, 0.1)
         centers = (lims[0] + lims[1]) / 2
         for j, c in enumerate(centers):
