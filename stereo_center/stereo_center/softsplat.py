@@ -188,7 +188,10 @@ def center_view(
 
     # ---- 融合 ----
     if blend in ("gate", "hybrid", "conflict", "softz"):
-        both = valid_l & valid_r
+        # 注意：softmax_splatting 返回的 valid 是"源像素是否投影出界"的掩码
+        # （按源坐标索引），不是"目标像素是否收到贡献"。覆盖判断必须用
+        # 目标像素上累计的权重和 norm（norm>0 表示至少一个源像素投到这里）。
+        both = (norm_l > 1e-6) & (norm_r > 1e-6)
         agree = (dep_l - dep_r).abs() <= depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1)
         closer_l = dep_l <= dep_r
         keep_l = agree | ~both | closer_l
