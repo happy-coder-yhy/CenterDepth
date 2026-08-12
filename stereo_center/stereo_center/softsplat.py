@@ -9,7 +9,12 @@ S²M² 官方推荐的 sniklaus/softmax-splatting 是 CUDA 算子；本工程在
 - 光度校正：融合前把右图每通道 gain/offset 对齐到左图（在 pipeline 层）；
 - 边缘感知权重：深度边缘（|∇d| 大）的源像素降权，减少跨边界混色重影；
 - 视差中值滤波：消除视差斑点噪声；
+- 权重语义（weight_mode）：修复"低置信/遮挡像素权重下限为 1"的缺陷，
+  exp=旧行为（exp(conf·occ)∈[1,e]，不抑制）；linear=线性抑制
+  （conf·occ∈[0,1]）；expdecay=指数衰减（exp(k(conf·occ−1))，k 控制抑制强度）；
 - 深度一致性门控（可选）：两视图深度不一致时只保留更近的一侧；
+- softz（软 z-buffer）：RGB 用深度+颜色一致性共同驱动的平滑选近，
+  Depth 用门控选近，消除软平均的"半透明双影"；
 - 背景深度遮挡填充：DIBR 孔洞填充，孔洞从"深度最大（背景）的邻居"逐层生长。
 """
 
@@ -67,6 +72,37 @@ def softmax_splatting(
     return warped, norm, valid.unsqueeze(1)
 
 
+def _reliability_weight(
+    conf: torch.Tensor,
+    occ: torch.Tensor,
+    edge: torch.Tensor | None,
+    mode: str,
+    k: float,
+) -> torch.Tensor:
+    """把 (conf, occ, edge) 转为传给 softmax_splatting 的 weight。
+
+    softmax_splatting 内部取 exp(weight)，因此这里返回的 weight 需满足
+    exp(weight) = 期望的"源像素可靠性"。基础可靠性 base = conf·occ·edge ∈ [0,1]。
+
+    mode:
+      - exp（旧行为）：weight = base → exp(base) ∈ [1, e]，低置信不抑制；
+      - linear：weight = log(base) → exp = base ∈ [0,1]，线性抑制；
+      - expdecay：weight = k·(base−1) → exp = exp(k(base−1)) ∈ [e^{−k}, 1]，
+        k 越大低置信抑制越强（默认 k=4，权重下限 ≈ 0.018）。
+    """
+    base = (conf * occ).clamp(0.0, 1.0)
+    if edge is not None:
+        base = base * edge
+    eps = 1e-6
+    if mode == "exp":
+        return base
+    if mode == "linear":
+        return torch.log(base + eps)
+    if mode == "expdecay":
+        return k * (base - 1.0)
+    raise ValueError(f"未知权重语义: {mode}（可选 exp/linear/expdecay）")
+
+
 def center_view(
     left_rgb: torch.Tensor,
     right_rgb: torch.Tensor,
@@ -83,6 +119,8 @@ def center_view(
     blend: str = "softavg",
     depth_tol: float = 0.15,
     color_tol: float = 25.0,
+    weight_mode: str = "exp",
+    weight_k: float = 4.0,
     return_warped: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """由校正后双目 + 立体匹配结果合成中心视角 RGB 与深度。
@@ -104,9 +142,12 @@ def center_view(
         blend: softavg=置信度加权软平均；gate=深度一致性门控（不一致时只保留
                更近一侧）；hybrid=RGB 用软平均、Depth 用门控选近；conflict=
                软平均 + 冲突抑制（两视图深度或颜色差异大时平滑切换为单视图，
-               消除近距离双影）。
+               消除近距离双影）；softz=软 z-buffer（RGB 用深度+颜色一致性
+               平滑选近、Depth 门控选近，比 conflict 更平滑）。
         depth_tol: blend=gate 时的相对深度容差。
         color_tol: blend=conflict 时的颜色冲突阈值（两 warp 平均色差，0-255）。
+        weight_mode: 软投影权重语义（exp/linear/expdecay），见 _reliability_weight。
+        weight_k: weight_mode=expdecay 时的抑制强度系数。
 
     Returns:
         center_rgb: (1, 3, H, W) 中心 RGB；
@@ -114,9 +155,8 @@ def center_view(
         valid: (1, 1, H, W) 有效掩码。
     """
     d_l = _median_filter(disp_left.clamp(min=0.0), median_k)
-    weight_left = (conf_left * occ_left).clamp(0.0, 1.0)
-    if edge_k > 0:
-        weight_left = weight_left * _edge_weight(d_l, edge_k)
+    edge_l = _edge_weight(d_l, edge_k) if edge_k > 0 else None
+    weight_left = _reliability_weight(conf_left, occ_left, edge_l, weight_mode, weight_k)
     zero = torch.zeros_like(d_l)
 
     # ---- 左视图 -> 中心 ----
@@ -128,9 +168,8 @@ def center_view(
     # ---- 右视图 -> 中心 ----
     if disp_right is not None:
         d_r = _median_filter(disp_right.clamp(min=0.0), median_k)
-        weight_right = (conf_right * occ_right).clamp(0.0, 1.0)
-        if edge_k > 0:
-            weight_right = weight_right * _edge_weight(d_r, edge_k)
+        edge_r = _edge_weight(d_r, edge_k) if edge_k > 0 else None
+        weight_right = _reliability_weight(conf_right, occ_right, edge_r, weight_mode, weight_k)
         flow_r = torch.cat([d_r / 2.0, zero], dim=1)
         depth_right = fx * baseline / d_r.clamp_min(0.5)
         rgb_r, norm_r, valid_r = softmax_splatting(
@@ -148,7 +187,7 @@ def center_view(
         dep_r, _, _ = softmax_splatting(depth_right, flow_r, ones)
 
     # ---- 融合 ----
-    if blend in ("gate", "hybrid", "conflict"):
+    if blend in ("gate", "hybrid", "conflict", "softz"):
         both = valid_l & valid_r
         agree = (dep_l - dep_r).abs() <= depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1)
         closer_l = dep_l <= dep_r
@@ -157,10 +196,28 @@ def center_view(
         if blend == "gate":
             w_l_rgb = w_l_dep = norm_l * keep_l.to(norm_l.dtype)
             w_r_rgb = w_r_dep = norm_r * keep_r.to(norm_r.dtype)
-        elif blend == "hybrid":  # RGB 软平均，Depth 门控选近
+        elif blend in ("hybrid", "softz"):  # RGB 软平均/软 z-buffer，Depth 门控选近
             w_l_rgb, w_r_rgb = norm_l, norm_r
             w_l_dep = norm_l * keep_l.to(norm_l.dtype)
             w_r_dep = norm_r * keep_r.to(norm_r.dtype)
+            if blend == "softz":
+                # RGB 软 z-buffer：深度/颜色任一冲突时，平滑抑制更远一侧，
+                # 消除软平均的"半透明双影"（比 conflict 的切换更平滑）
+                dconf = (
+                    (dep_l - dep_r).abs()
+                    / (depth_tol * torch.minimum(dep_l, dep_r).clamp_min(0.1))
+                    - 1.0
+                ).clamp(0.0, 1.0)
+                cdiff = (rgb_l - rgb_r).abs().mean(dim=1, keepdim=True)
+                cconf = ((cdiff - color_tol) / max(color_tol, 1e-3)).clamp(0.0, 1.0)
+                conflict = torch.maximum(dconf, cconf)
+                # smoothstep：让"软平均 → 单视图"的切换没有可见折线
+                s = conflict * conflict * (3.0 - 2.0 * conflict)
+                both_f = both.to(norm_l.dtype)
+                suppress = s * both_f  # 只有两视图都覆盖才抑制
+                prefer_l = closer_l
+                w_l_rgb = norm_l * (1.0 - suppress * (~prefer_l).to(norm_l.dtype))
+                w_r_rgb = norm_r * (1.0 - suppress * prefer_l.to(norm_r.dtype))
         else:  # conflict：深度/颜色冲突处平滑切换为更近的单视图
             dconf = (
                 (dep_l - dep_r).abs()
@@ -247,6 +304,7 @@ def fill_disocclusion(
     depth: np.ndarray,
     valid: np.ndarray,
     max_iter: int = 24,
+    depth_tol: float = 0.3,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """基于背景深度的 DIBR 遮挡填充（低成本孔洞修复）。
 
@@ -254,11 +312,16 @@ def fill_disocclusion(
     这里让孔洞像素逐层从"深度最大（背景）的已填充邻居"生长，
     避免前景颜色/深度混入遮挡区。
 
+    边界感知：8 邻域生长，且一旦孔洞有了背景深度估计，就拒绝与估计
+    相差超过 depth_tol（相对值）的邻居——即不跨深度边缘取前景颜色，
+    防止前景颜色沿孔洞"渗"进遮挡区。
+
     Args:
         rgb: (H, W, 3) float32/uint8 中心 RGB。
         depth: (H, W) float32 中心深度（米），孔洞处为 0。
         valid: (H, W) bool 有效掩码。
         max_iter: 最大生长迭代数（约等于最大孔洞宽度像素数）。
+        depth_tol: 边界感知深度容差（相对值，0.3=允许邻居深度 ≥ 背景估计的 70%）。
 
     Returns:
         填充后的 (rgb, depth, valid)（rgb 保持原 dtype）。
@@ -278,11 +341,16 @@ def fill_disocclusion(
         any_nb = np.zeros((H, W), dtype=bool)
         best_d = np.full((H, W), -np.inf, dtype=np.float32)
         best_c = np.zeros((H, W, 3), dtype=np.float32) if rgb3 else None
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        for dy, dx in (
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        ):
             d_nb = _neighbor(dep, dy, dx)
             v_nb = _neighbor(filled.astype(np.float32), dy, dx) > 0.5
             any_nb |= v_nb
-            sel = v_nb & (d_nb >= best_d)
+            # 边界感知：已有背景估计的孔洞，拒绝与估计相差过大的邻居（前景）
+            consistent = (best_d <= -np.inf) | (d_nb >= best_d * (1.0 - depth_tol))
+            sel = v_nb & consistent & (d_nb >= best_d)
             best_d = np.where(sel, d_nb, best_d)
             if rgb3:
                 c_nb = _neighbor(col, dy, dx)

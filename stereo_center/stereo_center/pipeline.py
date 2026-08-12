@@ -16,7 +16,9 @@ DEFAULT_FUSION = {
     "edge_k": 1.5,        # 边缘感知权重系数（0=关）
     "median_k": 0,        # 视差中值滤波核（0/1=关；本地消融显示无益，默认关）
     "fill_holes": True,   # 背景深度遮挡填充
-    "blend": "hybrid",    # softavg / gate / hybrid / conflict（实测 hybrid 观感最佳，默认）
+    "blend": "softz",     # softavg / gate / hybrid / conflict / softz
+    "weight_mode": "expdecay",  # exp / linear / expdecay（修复低置信不抑制）
+    "weight_k": 4.0,      # expdecay 抑制强度（权重下限 e^{-4}≈0.018）
     "color_tol": 25.0,    # conflict 模式的颜色冲突阈值（0-255）
 }
 
@@ -135,6 +137,8 @@ def process_stereo_pair(
         edge_k=f["edge_k"],
         median_k=f["median_k"],
         blend=f["blend"],
+        weight_mode=f["weight_mode"],
+        weight_k=f["weight_k"],
         return_warped=True,
     )
 

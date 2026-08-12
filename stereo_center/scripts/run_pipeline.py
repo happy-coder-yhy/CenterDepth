@@ -108,12 +108,21 @@ def main() -> None:
         help="覆盖融合选项：背景深度遮挡填充（improved 默认 1）",
     )
     parser.add_argument(
-        "--fusion-blend", type=str, default=None, choices=["softavg", "gate", "hybrid", "conflict"],
-        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控；conflict=软平均+冲突抑制（improved 默认 hybrid）",
+        "--fusion-blend", type=str, default=None,
+        choices=["softavg", "gate", "hybrid", "conflict", "softz"],
+        help="覆盖融合选项：softavg=软平均；gate=深度一致性门控；hybrid=RGB 软平均+Depth 门控；conflict=软平均+冲突抑制；softz=软 z-buffer（RGB 深度+颜色平滑选近，默认）",
     )
     parser.add_argument(
         "--fusion-color-tol", type=float, default=None,
         help="覆盖融合选项：conflict 模式颜色冲突阈值（0-255，improved 默认 25）",
+    )
+    parser.add_argument(
+        "--fusion-weight", type=str, default=None, choices=["exp", "linear", "expdecay"],
+        help="覆盖融合选项：软投影权重语义（improved 默认 expdecay）；exp=旧行为（低置信不抑制）；linear=线性抑制；expdecay=指数衰减",
+    )
+    parser.add_argument(
+        "--fusion-weight-k", type=float, default=None,
+        help="覆盖融合选项：expdecay 抑制强度 k（默认 4，越大低置信抑制越强）",
     )
     parser.add_argument("--no-pointcloud", action="store_true", help="不输出 3D 点云")
     parser.add_argument("--max-points", type=int, default=1_000_000, help="点云体素降采样后点数上限")
@@ -139,6 +148,8 @@ def main() -> None:
             "median_k": 0,
             "fill_holes": False,
             "blend": "softavg",
+            "weight_mode": "exp",
+            "weight_k": 4.0,
             "color_tol": 25.0,
         }
     else:
@@ -157,9 +168,13 @@ def main() -> None:
         fusion["blend"] = args.fusion_blend
     if args.fusion_color_tol is not None:
         fusion["color_tol"] = args.fusion_color_tol
-    if fusion["blend"] not in ("softavg", "gate", "hybrid", "conflict"):
+    if args.fusion_weight is not None:
+        fusion["weight_mode"] = args.fusion_weight
+    if args.fusion_weight_k is not None:
+        fusion["weight_k"] = args.fusion_weight_k
+    if fusion["blend"] not in ("softavg", "gate", "hybrid", "conflict", "softz"):
         raise ValueError(
-            f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid/conflict）"
+            f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid/conflict/softz）"
         )
 
     outdir = Path(args.outdir)
@@ -323,6 +338,8 @@ def main() -> None:
             "fusion_median_k": fusion["median_k"],
             "fusion_fill_holes": int(fusion["fill_holes"]),
             "fusion_blend": fusion["blend"],
+            "fusion_weight_mode": fusion["weight_mode"],
+            "fusion_weight_k": fusion["weight_k"],
             "fusion_color_tol": fusion["color_tol"],
         }
     )
