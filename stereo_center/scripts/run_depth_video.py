@@ -143,13 +143,12 @@ def main() -> None:
         help="对数米制色阶上限（米，默认 20；超出部分饱和为红色）",
     )
     parser.add_argument(
-        "--temporal-median", type=int, default=3,
-        help="时间维中值滤波窗口（奇数，1=关闭；默认 3 抑制逐帧深度抖动）",
+        "--temporal-median", type=int, default=15,
+        help="时间维中值滤波窗口（奇数，1=关闭；默认 15≈0.5s，压制背景模式切换抖动）",
     )
     parser.add_argument(
-        "--temporal-ema", type=float, default=0.0,
-        help="时间维 EMA 系数：0=自适应（默认，按校正左图帧间差异 α∈[0.06,0.9]）；"
-        ">0=固定系数（如 0.3）；1=关闭",
+        "--temporal-ema", type=float, default=0.15,
+        help="时间维 EMA 系数（默认 0.15，配合中值 15 帧；1=关闭）",
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
