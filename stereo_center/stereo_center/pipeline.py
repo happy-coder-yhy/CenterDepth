@@ -19,6 +19,13 @@ DEFAULT_FUSION = {
     "blend": "softz",     # softavg / gate / hybrid / conflict / softz
     "weight_mode": "expdecay",  # exp / linear / expdecay（修复低置信不抑制）
     "weight_k": 4.0,      # expdecay 抑制强度（权重下限 e^{-4}≈0.018）
+    "depth_z": True,      # 中心深度用 hard z-buffer（最近点胜出，边缘锐利）
+    "depth_z_thresh": 0.05,  # 参与深度 z-buffer 的 conf·occ 阈值（仅剔除真正无效源）
+    "depth_z_power": 2.0,  # 跨视图深度融合软 z 权重指数（w ∝ 1/depth^p）
+    "depth_jbf": False,   # RGB 引导联合双边滤波（实验项，实测收益有限，默认关）
+    "depth_jbf_radius": 2,
+    "depth_jbf_sigma_c": 18.0,
+    "depth_jbf_iters": 1,
     "color_tol": 25.0,    # conflict 模式的颜色冲突阈值（0-255）
 }
 
@@ -139,6 +146,9 @@ def process_stereo_pair(
         blend=f["blend"],
         weight_mode=f["weight_mode"],
         weight_k=f["weight_k"],
+        depth_z=f["depth_z"],
+        depth_z_thresh=f["depth_z_thresh"],
+        depth_z_power=f["depth_z_power"],
         return_warped=True,
     )
 
@@ -164,6 +174,14 @@ def process_stereo_pair(
     if f["fill_holes"]:
         center_rgb_np, center_depth_np, valid_np = softsplat.fill_disocclusion(
             center_rgb_np, center_depth_np, valid_np
+        )
+    if f["depth_jbf"]:
+        center_depth_np = softsplat.joint_bilateral_depth(
+            center_depth_np,
+            cv2.cvtColor(center_rgb_np, cv2.COLOR_RGB2BGR),
+            radius=f["depth_jbf_radius"],
+            sigma_c=f["depth_jbf_sigma_c"],
+            iters=f["depth_jbf_iters"],
         )
 
     return PipelineResult(

@@ -124,6 +124,22 @@ def main() -> None:
         "--fusion-weight-k", type=float, default=None,
         help="覆盖融合选项：expdecay 抑制强度 k（默认 4，越大低置信抑制越强）",
     )
+    parser.add_argument(
+        "--fusion-depth-z", type=int, default=None, choices=[0, 1],
+        help="覆盖融合选项：中心深度用 hard z-buffer（1=最近点胜出，边缘锐利；默认开）",
+    )
+    parser.add_argument(
+        "--fusion-depth-z-thresh", type=float, default=None,
+        help="覆盖融合选项：参与深度 z-buffer 的 conf·occ 阈值（默认 0.05）",
+    )
+    parser.add_argument(
+        "--fusion-depth-z-power", type=float, default=None,
+        help="覆盖融合选项：跨视图深度融合软 z 权重指数（默认 2.0；0=普通平均）",
+    )
+    parser.add_argument(
+        "--fusion-depth-jbf", type=int, default=None, choices=[0, 1],
+        help="覆盖融合选项：RGB 引导联合双边滤波锐化深度边缘（默认开）",
+    )
     parser.add_argument("--no-pointcloud", action="store_true", help="不输出 3D 点云")
     parser.add_argument("--max-points", type=int, default=1_000_000, help="点云体素降采样后点数上限")
     parser.add_argument("--stride", type=int, default=1, help="点云深度图采样步长（默认 1=全分辨率）")
@@ -150,6 +166,10 @@ def main() -> None:
             "blend": "softavg",
             "weight_mode": "exp",
             "weight_k": 4.0,
+            "depth_z": False,
+            "depth_z_thresh": 0.25,
+            "depth_z_power": 2.0,
+            "depth_jbf": False,
             "color_tol": 25.0,
         }
     else:
@@ -172,6 +192,14 @@ def main() -> None:
         fusion["weight_mode"] = args.fusion_weight
     if args.fusion_weight_k is not None:
         fusion["weight_k"] = args.fusion_weight_k
+    if args.fusion_depth_z is not None:
+        fusion["depth_z"] = bool(args.fusion_depth_z)
+    if args.fusion_depth_z_thresh is not None:
+        fusion["depth_z_thresh"] = args.fusion_depth_z_thresh
+    if args.fusion_depth_z_power is not None:
+        fusion["depth_z_power"] = args.fusion_depth_z_power
+    if args.fusion_depth_jbf is not None:
+        fusion["depth_jbf"] = bool(args.fusion_depth_jbf)
     if fusion["blend"] not in ("softavg", "gate", "hybrid", "conflict", "softz"):
         raise ValueError(
             f"未知融合模式: {fusion['blend']}（可选 softavg/gate/hybrid/conflict/softz）"
@@ -340,6 +368,10 @@ def main() -> None:
             "fusion_blend": fusion["blend"],
             "fusion_weight_mode": fusion["weight_mode"],
             "fusion_weight_k": fusion["weight_k"],
+            "fusion_depth_z": int(fusion["depth_z"]),
+            "fusion_depth_z_thresh": fusion["depth_z_thresh"],
+            "fusion_depth_z_power": fusion["depth_z_power"],
+            "fusion_depth_jbf": int(fusion["depth_jbf"]),
             "fusion_color_tol": fusion["color_tol"],
         }
     )

@@ -15,11 +15,18 @@ S²M² 官方推荐的 sniklaus/softmax-splatting 是 CUDA 算子；本工程在
 - 深度一致性门控（可选）：两视图深度不一致时只保留更近的一侧；
 - softz（软 z-buffer）：RGB 用深度+颜色一致性共同驱动的平滑选近，
   Depth 用门控选近，消除软平均的"半透明双影"；
+- 深度 hard z-buffer（depth_z）：中心深度用"最近点胜出"而非软平均投影，
+  恢复深度边缘锐度（软平均会把物体边缘抹糊）；
+- 深度软 z 权重（depth_z_power）：左右两视图融合时按 1/depth^p 加权，
+  更近的视图占主导，边缘锐利且无硬切换接缝；
+- RGB 引导联合双边滤波（depth_jbf）：把中心深度边缘与 RGB 边缘对齐、
+  收窄过渡带（物体边缘更锐利）；
 - 背景深度遮挡填充：DIBR 孔洞填充，孔洞从"深度最大（背景）的邻居"逐层生长。
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -72,6 +79,47 @@ def softmax_splatting(
     return warped, norm, valid.unsqueeze(1)
 
 
+def hard_min_splatting(
+    feature: torch.Tensor,
+    flow: torch.Tensor,
+    keep: torch.Tensor,
+) -> torch.Tensor:
+    """hard z-buffer 前向投影：每个目标像素取所有源中 feature 最小的源。
+
+    与 softmax_splatting 的加权平均不同，这里不做平均、直接"最近胜出"，
+    用于输出边缘锐利的中心深度（feature=深度时最小=最近）。参与竞争的源
+    由 keep 掩码筛选（低置信/被遮挡的源被剔除）。
+
+    Args:
+        feature: (B, 1, H, W) 标量特征（深度）。
+        flow: (B, 2, H, W) 前向流。
+        keep: (B, 1, H, W) bool，参与 z-buffer 竞争的源像素。
+
+    Returns:
+        (B, 1, H, W) 各目标像素的最小 feature；无源投到处的像素为 0（无效）。
+    """
+    B, C, H, W = feature.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=feature.device),
+        torch.arange(W, device=feature.device),
+        indexing="ij",
+    )
+    tx = (xx.unsqueeze(0) + flow[:, 0]).round().long()
+    ty = (yy.unsqueeze(0) + flow[:, 1]).round().long()
+    inb = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H) & keep[:, 0]
+    idx = (ty * W + tx).reshape(B, -1)
+    v = inb.reshape(B, -1)
+    out = torch.full(
+        (B, H * W), float("inf"), dtype=feature.dtype, device=feature.device
+    )
+    for b in range(B):
+        sel = idx[b][v[b]]
+        f = feature[b, 0].reshape(-1)[v[b]]
+        out[b].index_reduce_(0, sel, f, reduce="amin", include_self=False)
+    out = out.reshape(B, 1, H, W)
+    return torch.where(torch.isfinite(out), out, torch.zeros_like(out))
+
+
 def _reliability_weight(
     conf: torch.Tensor,
     occ: torch.Tensor,
@@ -121,6 +169,9 @@ def center_view(
     color_tol: float = 25.0,
     weight_mode: str = "exp",
     weight_k: float = 4.0,
+    depth_z: bool = True,
+    depth_z_thresh: float = 0.05,
+    depth_z_power: float = 2.0,
     return_warped: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """由校正后双目 + 立体匹配结果合成中心视角 RGB 与深度。
@@ -148,6 +199,11 @@ def center_view(
         color_tol: blend=conflict 时的颜色冲突阈值（两 warp 平均色差，0-255）。
         weight_mode: 软投影权重语义（exp/linear/expdecay），见 _reliability_weight。
         weight_k: weight_mode=expdecay 时的抑制强度系数。
+        depth_z: 中心深度用 hard z-buffer（最近点胜出）替代软平均，边缘更锐利。
+        depth_z_thresh: 参与 z-buffer 的源可靠性阈值（基于 conf·occ，
+          不含边缘降权；低于阈值的源不参与竞争）。
+        depth_z_power: 跨视图深度融合的软 z 权重指数（w ∝ 1/depth^p，
+          p 越大更近视图越占主导、边缘越锐利；0=普通加权平均）。
 
     Returns:
         center_rgb: (1, 3, H, W) 中心 RGB；
@@ -157,25 +213,41 @@ def center_view(
     d_l = _median_filter(disp_left.clamp(min=0.0), median_k)
     edge_l = _edge_weight(d_l, edge_k) if edge_k > 0 else None
     weight_left = _reliability_weight(conf_left, occ_left, edge_l, weight_mode, weight_k)
+    # 深度 z-buffer 参与掩码：基于 conf·occ（不含边缘降权），模式无关；
+    # 无可靠源的像素回退软平均深度（见下），保证不产生空洞
+    rel_left = (conf_left * occ_left).clamp(0.0, 1.0)
     zero = torch.zeros_like(d_l)
 
     # ---- 左视图 -> 中心 ----
     flow_l = torch.cat([-d_l / 2.0, zero], dim=1)
     depth_left = fx * baseline / d_l.clamp_min(0.5)
     rgb_l, norm_l, valid_l = softmax_splatting(left_rgb, flow_l, weight_left)
-    dep_l, _, _ = softmax_splatting(depth_left, flow_l, weight_left)
+    if depth_z:
+        dep_soft_l, _, _ = softmax_splatting(depth_left, flow_l, weight_left)
+        dep_hard_l = hard_min_splatting(depth_left, flow_l, rel_left > depth_z_thresh)
+        dep_l = torch.where(dep_hard_l > 0, dep_hard_l, dep_soft_l)
+    else:
+        dep_l, _, _ = softmax_splatting(depth_left, flow_l, weight_left)
+    dep_ok_l = torch.isfinite(dep_l) & (dep_l > 0)
 
     # ---- 右视图 -> 中心 ----
     if disp_right is not None:
         d_r = _median_filter(disp_right.clamp(min=0.0), median_k)
         edge_r = _edge_weight(d_r, edge_k) if edge_k > 0 else None
         weight_right = _reliability_weight(conf_right, occ_right, edge_r, weight_mode, weight_k)
+        rel_right = (conf_right * occ_right).clamp(0.0, 1.0)
         flow_r = torch.cat([d_r / 2.0, zero], dim=1)
         depth_right = fx * baseline / d_r.clamp_min(0.5)
         rgb_r, norm_r, valid_r = softmax_splatting(
             right_rgb, flow_r, weight_right
         )
-        dep_r, _, _ = softmax_splatting(depth_right, flow_r, weight_right)
+        if depth_z:
+            dep_soft_r, _, _ = softmax_splatting(depth_right, flow_r, weight_right)
+            dep_hard_r = hard_min_splatting(depth_right, flow_r, rel_right > depth_z_thresh)
+            dep_r = torch.where(dep_hard_r > 0, dep_hard_r, dep_soft_r)
+        else:
+            dep_r, _, _ = softmax_splatting(depth_right, flow_r, weight_right)
+        dep_ok_r = torch.isfinite(dep_r) & (dep_r > 0)
     else:
         # 回退（旧行为）：把 d/2 场从左图坐标前向投影到右图坐标，得到 dR(xR)/2
         flow_l2r = torch.cat([-d_l, zero], dim=1)
@@ -185,6 +257,7 @@ def center_view(
         ones = torch.ones_like(weight_left)
         rgb_r, norm_r, valid_r = softmax_splatting(right_rgb, flow_r, ones)
         dep_r, _, _ = softmax_splatting(depth_right, flow_r, ones)
+        dep_ok_r = torch.isfinite(dep_r) & (dep_r > 0)
 
     # ---- 融合 ----
     if blend in ("gate", "hybrid", "conflict", "softz"):
@@ -241,11 +314,21 @@ def center_view(
     else:  # softavg
         w_l_rgb = w_l_dep = norm_l
         w_r_rgb = w_r_dep = norm_r
+    # 深度贡献仅来自"有有效深度"的视图（hard z-buffer 空洞处不参与融合）
+    w_l_dep = w_l_dep * dep_ok_l.to(w_l_dep.dtype)
+    w_r_dep = w_r_dep * dep_ok_r.to(w_r_dep.dtype)
+    if depth_z and depth_z_power > 0:
+        # 软 z-buffer 跨视图权重：更近的视图占主导（比"agree 内平均"更锐利）
+        w_l_dep = w_l_dep / dep_l.clamp_min(1e-3).pow(depth_z_power)
+        w_r_dep = w_r_dep / dep_r.clamp_min(1e-3).pow(depth_z_power)
     wsum_rgb = w_l_rgb + w_r_rgb
     wsum_dep = w_l_dep + w_r_dep
-    valid = wsum_rgb > 1e-6
+    valid = (wsum_rgb > 1e-6) & (wsum_dep > 1e-6)
     center_rgb = (w_l_rgb * rgb_l + w_r_rgb * rgb_r) / wsum_rgb.clamp_min(1e-6)
     center_depth = (w_l_dep * dep_l + w_r_dep * dep_r) / wsum_dep.clamp_min(1e-6)
+    center_depth = torch.where(
+        torch.isfinite(center_depth), center_depth, torch.zeros_like(center_depth)
+    )
     center_depth = center_depth * valid.to(center_depth.dtype)
     if return_warped:
         return (
@@ -369,3 +452,50 @@ def fill_disocclusion(
     if rgb.dtype == np.uint8:
         col = np.clip(col, 0, 255).astype(np.uint8)
     return col, dep, filled
+
+
+def joint_bilateral_depth(
+    depth: np.ndarray,
+    guide_rgb: np.ndarray,
+    radius: int = 2,
+    sigma_s: float = 2.0,
+    sigma_c: float = 18.0,
+    iters: int = 1,
+) -> np.ndarray:
+    """RGB 引导的联合双边滤波（中心深度边缘锐化）。
+
+    深度值在颜色相近的区域被平滑，在颜色边缘处被保留——结果是把
+    原本被软平均抹宽的深度过渡带收窄、并与 RGB 边缘对齐。
+
+    Args:
+        depth: (H, W) float32 中心深度（米），孔洞应已填充。
+        guide_rgb: (H, W, 3) uint8 BGR 中心 RGB。
+        radius: 空间窗口半径（像素）。
+        sigma_s: 空间高斯 sigma（像素）。
+        sigma_c: 颜色高斯 sigma（0-255 尺度）。
+        iters: 迭代次数（1 足够；2 更强锐化）。
+
+    Returns:
+        锐化后的 (H, W) float32 深度。
+    """
+    d = np.asarray(depth, dtype=np.float32)
+    g = cv2.cvtColor(np.asarray(guide_rgb), cv2.COLOR_BGR2RGB).astype(np.float32)
+    H, W = d.shape
+    cst = 2.0 * sigma_s * sigma_s
+    ccc = 2.0 * sigma_c * sigma_c
+    out = d.copy()
+    for _ in range(iters):
+        num = np.zeros((H, W), dtype=np.float32)
+        den = np.zeros((H, W), dtype=np.float32)
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                w = float(np.exp(-(dy * dy + dx * dx) / cst))
+                dq = _neighbor(d, dy, dx)
+                gq = _neighbor(g, dy, dx)
+                cd = ((g - gq) ** 2).sum(axis=2)
+                wq = w * np.exp(-cd / ccc)
+                num += wq * dq
+                den += wq
+        out = num / np.maximum(den, 1e-6)
+        d = out
+    return out

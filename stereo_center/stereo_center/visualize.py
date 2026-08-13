@@ -7,13 +7,18 @@ import numpy as np
 
 
 def colorize_depth(depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """深度 -> jet 伪彩图（无效区域为黑色）。"""
+    """深度 -> jet 伪彩图（无效区域为黑色）。
+
+    归一化用 p98 百分位 + gamma 0.6：线性 jet 会把近场（小深度）压到
+    很小的色域、边缘看起来模糊；gamma 扩展近场对比，让物体边缘清晰。
+    """
     d = depth.copy()
     d[~valid] = np.nan
     if not np.isfinite(d).any():
         return np.zeros((*depth.shape, 3), dtype=np.uint8)
-    vmax = np.nanpercentile(d, 95)
+    vmax = np.nanpercentile(d, 98)
     norm = np.clip(np.nan_to_num(d / max(vmax, 1e-6), nan=0.0), 0, 1)
+    norm = norm**0.6  # gamma：扩展近场（小深度）对比
     norm = (norm * 255).astype(np.uint8)
     colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
     colored[~valid] = 0

@@ -216,12 +216,13 @@ def main() -> None:
 
 
 def pointcloud_depth_png(depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """深度 -> jet 伪彩图（与 run_pipeline 风格一致）。"""
+    """深度 -> jet 伪彩图（与 run_pipeline 风格一致：p98 + gamma 0.6）。"""
     d = np.where(valid, depth, np.nan)
     if not np.isfinite(d).any():
         return np.zeros((*depth.shape, 3), dtype=np.uint8)
-    vmax = np.nanpercentile(d, 95)
+    vmax = np.nanpercentile(d, 98)
     norm = np.clip(np.nan_to_num(d / max(vmax, 1e-6), nan=0.0), 0, 1)
+    norm = norm**0.6
     img = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
     img[~valid] = 0
     return img
