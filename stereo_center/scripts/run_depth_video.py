@@ -6,16 +6,21 @@
         --video ../dataset/xxx/output.mp4 --calib ../dataset/xxx/calibration.json \
         --scale 0.5 --batch-size 4 --outdir outputs/depth_video
 
-模型只加载一次，视频帧按 batch 送入 WAFT 前向（s0.5 为 direct 路径，
-实测 B=4 时 960x600 前向约 0.93s/批，显存峰值 ~9GB）。
+- 深度值恒为米制：depth = fx * baseline / disparity。
+- 色阶默认绝对米制一致：先采样估计全片 p98 作为全局上限，所有帧共用同一
+  0~vmax jet 色阶（同色=同米），并保存 colorbar.png；--vmax-m 可指定固定上限。
+- 时间维中值滤波（默认 3 帧）抑制 WAFT 逐帧推理的深度抖动/闪烁。
+- 遮挡填充与融合都在 GPU 上批量执行。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -27,7 +32,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
+from stereo_center import calib, softsplat, stereo_backend, waft_inference  # noqa: E402
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.visualize import colorize_depth, make_depth_colorbar  # noqa: E402
 
@@ -36,8 +41,8 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
     if explicit:
         return Path(explicit)
     env = "WAFT_WEIGHTS_DIR" if backend == "waft" else "S2M2_WEIGHTS_DIR"
-    if env in __import__("os").environ:
-        return Path(__import__("os").environ[env])
+    if env in os.environ:
+        return Path(os.environ[env])
     repo_root = PROJECT_ROOT.parent
     sub = "waft" if backend == "waft" else "pretrain_weights"
     for c in (repo_root / "weights" / sub, PROJECT_ROOT / "weights" / sub):
@@ -46,8 +51,93 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
     raise FileNotFoundError(f"未找到权重目录（{backend}），请用 --weights 或环境变量 {env}")
 
 
+def process_batch(
+    model,
+    bgr_pairs: list,
+    rect: dict,
+    fx: float,
+    baseline: float,
+    args,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """校正后 BGR 对列表 → GPU 批量推理 + 融合 + 遮挡填充。
+
+    Returns:
+        dep_b: (B, 1, H, W) float32 GPU 中心深度（米，已填充）；
+        valid_b: (B, 1, H, W) bool GPU 有效掩码。
+    """
+    B = len(bgr_pairs)
+    H, W = bgr_pairs[0][0].shape[:2]
+    left_t = torch.zeros(B, 3, H, W)
+    right_t = torch.zeros(B, 3, H, W)
+    for b, (rL, rR) in enumerate(bgr_pairs):
+        left_t[b] = torch.from_numpy(cv2.cvtColor(rL, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
+        right_t[b] = torch.from_numpy(cv2.cvtColor(rR, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
+
+    dL, dR, occL, occR, confL, confR, _ = waft_inference.run_stereo_matching_bi_batch(
+        model, left_t, right_t, args.device,
+        hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
+    )
+    dev = args.device
+    fusion_out = []
+    for b in range(B):
+        rL_bgr, rR_bgr = bgr_pairs[b]
+        rR_f = photometric_align_right(rL_bgr, rR_bgr)
+        left_f = (
+            torch.from_numpy(cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2RGB))
+            .permute(2, 0, 1).float().unsqueeze(0).to(dev)
+        )
+        right_f = (
+            torch.from_numpy(cv2.cvtColor(rR_f, cv2.COLOR_BGR2RGB))
+            .permute(2, 0, 1).float().unsqueeze(0).to(dev)
+        )
+        dl = dL[b].unsqueeze(0).unsqueeze(0).to(dev)
+        dr = dR[b].unsqueeze(0).unsqueeze(0).to(dev)
+        cl = confL[b].unsqueeze(0).unsqueeze(0).to(dev)
+        cr = confR[b].unsqueeze(0).unsqueeze(0).to(dev)
+        ol = occL[b].unsqueeze(0).unsqueeze(0).to(dev)
+        orr = occR[b].unsqueeze(0).unsqueeze(0).to(dev)
+        rgb, dep, valid = softsplat.center_view(
+            left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
+            disp_right=dr, conf_right=cr, occ_right=orr,
+            edge_k=1.5, blend="softz", weight_mode="expdecay", weight_k=4.0,
+            depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
+            color_tol=args.color_tol,
+        )
+        fusion_out.append((rgb, dep, valid))
+    rgb_b = torch.cat([x[0] for x in fusion_out], dim=0)
+    dep_b = torch.cat([x[1] for x in fusion_out], dim=0)
+    valid_b = torch.cat([x[2] for x in fusion_out], dim=0)
+    rgb_b, dep_b, valid_b = softsplat.fill_disocclusion_torch(rgb_b, dep_b, valid_b)
+    return dep_b, valid_b
+
+
+def estimate_global_vmax(
+    args, model, cap, rect, fx, baseline, end: int, sample_step: int = 40
+) -> float:
+    """采样全片帧，估计全局深度 p98（米），作为绝对米制色阶上限。"""
+    p98s = []
+    for fidx in range(args.start_frame, end, sample_step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ok, img = cap.read()
+        if not ok:
+            continue
+        l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
+        rL, rR = calib.rectify_pair(l_bgr, r_bgr, rect)
+        dep_b, valid_b = process_batch(model, [(rL, rR)], rect, fx, baseline, args)
+        d = dep_b[0, 0].cpu().numpy()
+        v = valid_b[0, 0].cpu().numpy()
+        vals = d[v]
+        if len(vals):
+            p98s.append(float(np.percentile(vals, 98)))
+    if not p98s:
+        return 2.0
+    vmax = float(np.median(p98s))
+    print(f"[vmax] 全局 p98 估计：{vmax:.2f} m（样本 {len(p98s)} 帧）")
+    return vmax
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="批量中心深度视频生成")
+    parser = argparse.ArgumentParser(description="批量中心深度视频生成（米制色阶）")
     parser.add_argument("--video", type=str, required=True)
     parser.add_argument("--calib", type=str, required=True)
     parser.add_argument("--scale", type=float, default=0.5, help="校正输出缩放（建议 0.5）")
@@ -67,8 +157,12 @@ def main() -> None:
     parser.add_argument("--color-tol", type=float, default=15.0, help="softz 颜色冲突阈值")
     parser.add_argument("--depth-z", type=int, default=1, choices=[0, 1], help="深度 hard z-buffer")
     parser.add_argument(
-        "--vmax-m", type=float, default=2.0,
-        help="绝对米制色阶上限（米）；0=逐帧百分位色阶（旧行为）",
+        "--vmax-m", type=float, default=0.0,
+        help="绝对米制色阶上限（米）；0（默认）=自动估计全片全局 p98（跨帧一致）",
+    )
+    parser.add_argument(
+        "--temporal-median", type=int, default=3,
+        help="时间维中值滤波窗口（奇数，1=关闭；默认 3 抑制逐帧深度抖动）",
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
@@ -78,25 +172,21 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
 
-    # 1) 标定 + 校正表（所有帧共用）
     cal = calib.load_vdego_calibration(args.calib)
     out_size = (
         max(32, int(cal["resolution"][0] * args.scale)),
         max(32, int(cal["resolution"][1] * args.scale)),
     )
     rect = calib.compute_rectification_maps(cal, output_size=out_size)
-    fx, fy = rect["P1"][0, 0], rect["P1"][1, 1]
-    cx, cy = rect["P1"][0, 2], rect["P1"][1, 2]
+    fx = rect["P1"][0, 0]
     baseline = rect["baseline"]
     H, W = out_size[1], out_size[0]
     print(f"[rect] {W}x{H}, fx={fx:.1f}, baseline={baseline:.4f} m")
 
-    # 2) 模型（只加载一次）
     weights_dir = resolve_weights_dir(args.weights, backend)
     print(f"[weights] {weights_dir}")
     model = stereo_backend.load(backend, args.model_type, str(weights_dir), args.device, num_refine=3)
 
-    # 3) 视频读取 + 输出
     cap = cv2.VideoCapture(args.video)
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -104,25 +194,27 @@ def main() -> None:
     end = args.end_frame if args.end_frame >= 0 else n_total
     if args.max_frames > 0:
         end = min(end, args.start_frame + args.max_frames)
+    print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
+
+    # 绝对米制色阶上限：显式指定或自动估计全片 p98（跨帧一致）
+    vmax = args.vmax_m if args.vmax_m > 0 else estimate_global_vmax(args, model, cap, rect, fx, baseline, end)
+    cv2.imwrite(str(outdir / "colorbar.png"), make_depth_colorbar(vmax, height=H))
+    print(f"[color] 绝对米制色阶 0~{vmax:.2f}m（全片固定，colorbar.png 已保存）")
+
     writer = cv2.VideoWriter(
         str(outdir / args.video_name),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (W, H),
     )
-    if args.vmax_m > 0:
-        cv2.imwrite(str(outdir / "colorbar.png"), make_depth_colorbar(args.vmax_m, height=H))
-        print(f"[color] 绝对米制色阶 0~{args.vmax_m}m（colorbar.png 已保存）")
-    print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
 
     t_all = time.time()
-    t_infer = 0.0
-    t_fusion = 0.0
-    t_fill = 0.0
+    t_stereo_fusion_fill = 0.0
+    depth_tbuf = deque(maxlen=max(1, args.temporal_median))
+    win = max(1, args.temporal_median)
     frame_idx = args.start_frame
     processed = 0
     while frame_idx < end:
-        # 读一批帧
         batch_frames = []
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         for _ in range(min(args.batch_size, end - frame_idx)):
@@ -134,76 +226,23 @@ def main() -> None:
             break
         B = len(batch_frames)
 
-        # 校正（每帧 remap）并组 batch
-        left_t = torch.zeros(B, 3, H, W)
-        right_t = torch.zeros(B, 3, H, W)
         bgr_pairs = []
-        for b, img in enumerate(batch_frames):
+        for img in batch_frames:
             l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
-            rL, rR = calib.rectify_pair(l_bgr, r_bgr, rect)
-            bgr_pairs.append((rL, rR))
-            left_t[b] = torch.from_numpy(cv2.cvtColor(rL, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
-            right_t[b] = torch.from_numpy(cv2.cvtColor(rR, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
-
-        # 批量双向视差
-        from stereo_center import waft_inference
-
+            bgr_pairs.append(calib.rectify_pair(l_bgr, r_bgr, rect))
         t0 = time.time()
-        dL, dR, occL, occR, confL, confR, _ = waft_inference.run_stereo_matching_bi_batch(
-            model, left_t, right_t, args.device,
-            hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
-        )
-        infer_s = time.time() - t0
-        t_infer += infer_s
+        dep_b, valid_b = process_batch(model, bgr_pairs, rect, fx, baseline, args)
+        t_stereo_fusion_fill += time.time() - t0
 
-        # 逐帧融合（GPU），收集张量供批量 GPU 填充
-        fusion_out = []
         for b in range(B):
-            t0f = time.time()
-            rL_bgr, rR_bgr = bgr_pairs[b]
-            rR_f = photometric_align_right(rL_bgr, rR_bgr)
-            dev = args.device
-            left_f = (
-                torch.from_numpy(cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2RGB))
-                .permute(2, 0, 1)
-                .float()
-                .unsqueeze(0)
-                .to(dev)
-            )
-            right_f = (
-                torch.from_numpy(cv2.cvtColor(rR_f, cv2.COLOR_BGR2RGB))
-                .permute(2, 0, 1)
-                .float()
-                .unsqueeze(0)
-                .to(dev)
-            )
-            dl = dL[b].unsqueeze(0).unsqueeze(0).to(dev)
-            dr = dR[b].unsqueeze(0).unsqueeze(0).to(dev)
-            cl = confL[b].unsqueeze(0).unsqueeze(0).to(dev)
-            cr = confR[b].unsqueeze(0).unsqueeze(0).to(dev)
-            ol = occL[b].unsqueeze(0).unsqueeze(0).to(dev)
-            orr = occR[b].unsqueeze(0).unsqueeze(0).to(dev)
-            rgb, dep, valid = softsplat.center_view(
-                left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
-                disp_right=dr, conf_right=cr, occ_right=orr,
-                edge_k=1.5, blend="softz", weight_mode="expdecay", weight_k=4.0,
-                depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
-                color_tol=args.color_tol,
-            )
-            fusion_out.append((rgb, dep, valid))
-            t_fusion += time.time() - t0f
-        # 遮挡填充：GPU 批量（与融合同 device，batch 内并行）
-        t0fill = time.time()
-        rgb_b = torch.cat([x[0] for x in fusion_out], dim=0)
-        dep_b = torch.cat([x[1] for x in fusion_out], dim=0)
-        valid_b = torch.cat([x[2] for x in fusion_out], dim=0)
-        rgb_b, dep_b, valid_b = softsplat.fill_disocclusion_torch(rgb_b, dep_b, valid_b)
-        t_fill += time.time() - t0fill
-        vmax = args.vmax_m if args.vmax_m > 0 else None
-        for b in range(B):
-            rgb_np = rgb_b[b].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
-            dep_np = dep_b[b, 0].cpu().numpy()
-            valid_np = valid_b[b, 0].cpu().numpy().astype(bool)
+            d_cur = dep_b[b].unsqueeze(0)  # (1,1,H,W) GPU
+            v_cur = valid_b[b].unsqueeze(0)
+            if win > 1:
+                depth_tbuf.append(d_cur)
+                if len(depth_tbuf) == win:
+                    d_cur = torch.median(torch.stack(list(depth_tbuf)), dim=0).values
+            dep_np = d_cur[0, 0].cpu().numpy()
+            valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
             depth_img = colorize_depth(dep_np, valid_np, vmax=vmax)
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
@@ -216,7 +255,7 @@ def main() -> None:
             eta = (end - frame_idx) / rate if rate > 0 else 0
             print(
                 f"[progress] {processed}/{end - args.start_frame} 帧，"
-                f"推理 {infer_s:.1f}s/批，吞吐 {rate:.2f} 帧/s，ETA {eta/60:.1f} min",
+                f"吞吐 {rate:.2f} 帧/s，ETA {eta/60:.1f} min",
                 flush=True,
             )
 
@@ -238,11 +277,11 @@ def main() -> None:
         "avg_seconds_per_frame": round(total_s / max(processed, 1), 4),
         "color_tol": args.color_tol,
         "depth_z": bool(args.depth_z),
-        "vmax_m": args.vmax_m,
-        "stage_inference_seconds": round(t_infer, 2),
-        "stage_fusion_seconds": round(t_fusion, 2),
-        "stage_fill_seconds": round(t_fill, 2),
-        "stage_other_seconds": round(max(total_s - t_infer - t_fusion - t_fill, 0), 2),
+        "vmax_m": round(vmax, 3),
+        "vmax_source": "fixed" if args.vmax_m > 0 else "global_p98",
+        "temporal_median": win,
+        "stage_stereo_fusion_fill_seconds": round(t_stereo_fusion_fill, 2),
+        "stage_other_seconds": round(max(total_s - t_stereo_fusion_fill, 0), 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")
