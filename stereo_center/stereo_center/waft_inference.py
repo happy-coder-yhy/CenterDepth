@@ -303,3 +303,60 @@ def run_stereo_matching_bi(
         confR.float().cpu(),
         t1 + t2,
     )
+
+
+@torch.no_grad()
+def run_stereo_matching_bi_batch(
+    model: WAFT,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    device: str = "cuda",
+    use_amp: bool = True,
+    hiera: str = "auto",
+    conf_mode: str = "lr",
+    occ_mode: str = "lr",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """批量双向视差推理（深度视频用）。
+
+    left/right: (B, 3, H, W) 0-255 float RGB。模型前向按 batch 一次完成，
+    LR 一致性/置信度按帧逐帧计算（现有辅助函数为单帧实现）。
+
+    Returns:
+        (dL, dR, occL, occR, confL, confR, elapsed)，均为 (B, H, W) float32 CPU。
+    """
+    H, W = left.shape[-2:]
+    hiera_mode = _resolve_hiera(hiera, H, W)
+    lt = left.to(device)
+    rt = right.to(device)
+    out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
+    out_r, t2 = _run_once(
+        model,
+        torch.flip(rt, dims=[3]),
+        torch.flip(lt, dims=[3]),
+        hiera_mode,
+        use_amp,
+    )
+    dL = out_l["disp_pred"].float()  # (B, H, W)
+    dR = torch.flip(out_r["disp_pred"], dims=[2]).float()
+    B = dL.shape[0]
+    occL = torch.zeros_like(dL)
+    occR = torch.zeros_like(dL)
+    confL = torch.zeros_like(dL)
+    confR = torch.zeros_like(dL)
+    infoR = torch.flip(out_r["delta_info_preds"][-1], dims=[3])
+    for b in range(B):
+        l1 = dL[b].unsqueeze(0)
+        r1 = dR[b].unsqueeze(0)
+        if occ_mode == "visibility":
+            occL[b] = _visibility_mask(l1, H, W)
+            occR[b] = _visibility_mask(r1, H, W)
+        else:
+            occL[b] = _lr_consistency_mask(l1, r1, H, W)
+            occR[b] = _lr_consistency_mask(r1, l1, H, W)
+        if conf_mode == "lr":
+            confL[b] = _lr_confidence(l1, r1, H, W)
+            confR[b] = _lr_confidence(r1, l1, H, W)
+        else:
+            confL[b] = _conf_from_info(out_l["delta_info_preds"][-1][b : b + 1], conf_mode, l1)
+            confR[b] = _conf_from_info(infoR[b : b + 1], conf_mode, r1)
+    return dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), t1 + t2
