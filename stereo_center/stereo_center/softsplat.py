@@ -166,7 +166,7 @@ def center_view(
     median_k: int = 0,
     blend: str = "softavg",
     depth_tol: float = 0.15,
-    color_tol: float = 25.0,
+    color_tol: float = 15.0,
     weight_mode: str = "exp",
     weight_k: float = 4.0,
     depth_z: bool = True,
@@ -196,7 +196,8 @@ def center_view(
                消除近距离双影）；softz=软 z-buffer（RGB 用深度+颜色一致性
                平滑选近、Depth 门控选近，比 conflict 更平滑）。
         depth_tol: blend=gate 时的相对深度容差。
-        color_tol: blend=conflict 时的颜色冲突阈值（两 warp 平均色差，0-255）。
+        color_tol: blend=softz/conflict 时的颜色冲突阈值（两 warp 平均色差，
+          0-255；15 实测三帧重影归零，25 保留轻度残影）。
         weight_mode: 软投影权重语义（exp/linear/expdecay），见 _reliability_weight。
         weight_k: weight_mode=expdecay 时的抑制强度系数。
         depth_z: 中心深度用 hard z-buffer（最近点胜出）替代软平均，边缘更锐利。

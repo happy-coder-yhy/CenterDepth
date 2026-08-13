@@ -26,7 +26,7 @@ DEFAULT_FUSION = {
     "depth_jbf_radius": 2,
     "depth_jbf_sigma_c": 18.0,
     "depth_jbf_iters": 1,
-    "color_tol": 25.0,    # conflict 模式的颜色冲突阈值（0-255）
+    "color_tol": 15.0,    # softz/conflict 颜色冲突阈值（0-255）；15 实测三帧重影归零
 }
 
 

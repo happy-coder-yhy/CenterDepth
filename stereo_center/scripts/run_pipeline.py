@@ -114,7 +114,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fusion-color-tol", type=float, default=None,
-        help="覆盖融合选项：conflict 模式颜色冲突阈值（0-255，improved 默认 25）",
+        help="覆盖融合选项：softz/conflict 颜色冲突阈值（0-255，improved 默认 15）",
     )
     parser.add_argument(
         "--fusion-weight", type=str, default=None, choices=["exp", "linear", "expdecay"],
