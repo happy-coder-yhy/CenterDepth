@@ -149,14 +149,27 @@ def main() -> None:
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
             rR_f = photometric_align_right(rL_bgr, rR_bgr)
-            left_f = torch.from_numpy(cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
-            right_f = torch.from_numpy(cv2.cvtColor(rR_f, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float().unsqueeze(0)
-            dl = dL[b].unsqueeze(0).unsqueeze(0)
-            dr = dR[b].unsqueeze(0).unsqueeze(0)
-            cl = confL[b].unsqueeze(0).unsqueeze(0)
-            cr = confR[b].unsqueeze(0).unsqueeze(0)
-            ol = occL[b].unsqueeze(0).unsqueeze(0)
-            orr = occR[b].unsqueeze(0).unsqueeze(0)
+            dev = args.device
+            left_f = (
+                torch.from_numpy(cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2RGB))
+                .permute(2, 0, 1)
+                .float()
+                .unsqueeze(0)
+                .to(dev)
+            )
+            right_f = (
+                torch.from_numpy(cv2.cvtColor(rR_f, cv2.COLOR_BGR2RGB))
+                .permute(2, 0, 1)
+                .float()
+                .unsqueeze(0)
+                .to(dev)
+            )
+            dl = dL[b].unsqueeze(0).unsqueeze(0).to(dev)
+            dr = dR[b].unsqueeze(0).unsqueeze(0).to(dev)
+            cl = confL[b].unsqueeze(0).unsqueeze(0).to(dev)
+            cr = confR[b].unsqueeze(0).unsqueeze(0).to(dev)
+            ol = occL[b].unsqueeze(0).unsqueeze(0).to(dev)
+            orr = occR[b].unsqueeze(0).unsqueeze(0).to(dev)
             rgb, dep, valid = softsplat.center_view(
                 left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
                 disp_right=dr, conf_right=cr, occ_right=orr,
@@ -164,9 +177,9 @@ def main() -> None:
                 depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
                 color_tol=args.color_tol,
             )
-            rgb_np = rgb[0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).numpy()
-            dep_np = dep[0, 0].numpy()
-            valid_np = valid[0, 0].numpy().astype(bool)
+            rgb_np = rgb[0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
+            dep_np = dep[0, 0].cpu().numpy()
+            valid_np = valid[0, 0].cpu().numpy().astype(bool)
             rgb_np, dep_np, valid_np = softsplat.fill_disocclusion(rgb_np, dep_np, valid_np)
             depth_img = colorize_depth(dep_np, valid_np)  # BGR jet
             writer.write(depth_img)
