@@ -9,7 +9,7 @@
 - 深度值恒为米制：depth = fx * baseline / disparity。
 - 色阶为固定对数米制映射（0.3~20m，可调）：场景深度范围大时线性色阶
   顾此失彼，对数映射让近场/背景都有可分辨色带，且跨帧同深度同色。
-- 时间维中值滤波（默认 3 帧）抑制 WAFT 逐帧推理的深度抖动/闪烁。
+- 时间平滑默认关闭（逐帧深度）：时间滤波虽能压抖动，但会引入拖影/重影。
 - 遮挡填充与融合都在 GPU 上批量执行。
 """
 
@@ -143,21 +143,21 @@ def main() -> None:
         help="对数米制色阶上限（米，默认 20；超出部分饱和为红色）",
     )
     parser.add_argument(
-        "--temporal-median", type=int, default=3,
-        help="时间维中值滤波窗口（奇数，1=关闭；默认 3，只去孤立尖峰不拖影）",
+        "--temporal-median", type=int, default=1,
+        help="时间维中值滤波窗口（奇数，1=关闭；时间平滑易引入拖影，默认关闭）",
     )
     parser.add_argument(
-        "--temporal-ema", type=float, default=0.0,
-        help="时间维 EMA：0=光流运动补偿 EMA（默认，相机运动被补偿、无拖影）；"
-        ">0=固定系数（无光流）；1=关闭",
+        "--temporal-ema", type=float, default=1.0,
+        help="时间维 EMA：1=关闭（默认）；0=光流运动补偿（实验性，有重影风险）；"
+        ">0 且 <1=固定系数",
     )
     parser.add_argument(
         "--flow-alpha", type=float, default=0.2,
-        help="光流 EMA 融合系数（默认 0.2：当前帧占 20%，历史 80%）",
+        help="光流 EMA 融合系数（仅 --temporal-ema 0 时生效）",
     )
     parser.add_argument(
-        "--spatial-median", type=int, default=3,
-        help="逐帧深度空间 3x3 中值滤波核（奇数，1=关闭；默认 3 压边缘跳动）",
+        "--spatial-median", type=int, default=1,
+        help="逐帧深度空间 3x3 中值滤波核（奇数，1=关闭；默认关闭）",
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
