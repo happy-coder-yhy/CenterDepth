@@ -16,7 +16,6 @@ import argparse
 import json
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -31,13 +30,6 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.visualize import colorize_depth, make_depth_colorbar  # noqa: E402
-
-
-def _fill_and_colorize(args: tuple) -> np.ndarray:
-    """多进程工作函数：遮挡填充 + 米制色阶（在子进程执行）。"""
-    rgb_np, dep_np, valid_np, vmax = args
-    rgb_np, dep_np, valid_np = softsplat.fill_disocclusion(rgb_np, dep_np, valid_np)
-    return colorize_depth(dep_np, valid_np, vmax=vmax)
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
@@ -127,7 +119,6 @@ def main() -> None:
     t_infer = 0.0
     t_fusion = 0.0
     t_fill = 0.0
-    pool = ProcessPoolExecutor(max_workers=min(4, max(1, args.batch_size)))
     frame_idx = args.start_frame
     processed = 0
     while frame_idx < end:
@@ -165,7 +156,7 @@ def main() -> None:
         infer_s = time.time() - t0
         t_infer += infer_s
 
-        # 逐帧融合（GPU，批量内逐帧）
+        # 逐帧融合（GPU），收集张量供批量 GPU 填充
         fusion_out = []
         for b in range(B):
             t0f = time.time()
@@ -199,17 +190,21 @@ def main() -> None:
                 depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
                 color_tol=args.color_tol,
             )
-            rgb_np = rgb[0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
-            dep_np = dep[0, 0].cpu().numpy()
-            valid_np = valid[0, 0].cpu().numpy().astype(bool)
+            fusion_out.append((rgb, dep, valid))
             t_fusion += time.time() - t0f
-            fusion_out.append((rgb_np, dep_np, valid_np))
-        # 填充 + 色阶：多进程并行处理本批各帧
+        # 遮挡填充：GPU 批量（与融合同 device，batch 内并行）
         t0fill = time.time()
-        vmax = args.vmax_m if args.vmax_m > 0 else None
-        frames = list(pool.map(_fill_and_colorize, [(r, d, v, vmax) for r, d, v in fusion_out]))
+        rgb_b = torch.cat([x[0] for x in fusion_out], dim=0)
+        dep_b = torch.cat([x[1] for x in fusion_out], dim=0)
+        valid_b = torch.cat([x[2] for x in fusion_out], dim=0)
+        rgb_b, dep_b, valid_b = softsplat.fill_disocclusion_torch(rgb_b, dep_b, valid_b)
         t_fill += time.time() - t0fill
-        for b, depth_img in enumerate(frames):
+        vmax = args.vmax_m if args.vmax_m > 0 else None
+        for b in range(B):
+            rgb_np = rgb_b[b].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
+            dep_np = dep_b[b, 0].cpu().numpy()
+            valid_np = valid_b[b, 0].cpu().numpy().astype(bool)
+            depth_img = colorize_depth(dep_np, valid_np, vmax=vmax)
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
                 cv2.imwrite(str(outdir / f"frame_{frame_idx + b:05d}.png"), depth_img)
@@ -227,7 +222,6 @@ def main() -> None:
 
     writer.release()
     cap.release()
-    pool.shutdown()
     total_s = time.time() - t_all
     stats = {
         "video": str(args.video),

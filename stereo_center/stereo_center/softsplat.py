@@ -500,3 +500,68 @@ def joint_bilateral_depth(
         out = num / np.maximum(den, 1e-6)
         d = out
     return out
+
+
+def _shift_t(a: torch.Tensor, dy: int, dx: int) -> torch.Tensor:
+    """torch 版邻域平移：out[i,j] = a[i+dy, j+dx]，越界补 0。"""
+    B, C, H, W = a.shape
+    out = torch.zeros_like(a)
+    sy0, sy1 = max(0, dy), min(H, H + dy)
+    ty0, ty1 = max(0, -dy), min(H, H - dy)
+    sx0, sx1 = max(0, dx), min(W, W + dx)
+    tx0, tx1 = max(0, -dx), min(W, W - dx)
+    out[:, :, ty0:ty1, tx0:tx1] = a[:, :, sy0:sy1, sx0:sx1]
+    return out
+
+
+def fill_disocclusion_torch(
+    rgb: torch.Tensor,
+    depth: torch.Tensor,
+    valid: torch.Tensor,
+    max_iter: int = 24,
+    depth_tol: float = 0.3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GPU 版基于背景深度的遮挡填充（语义与 fill_disocclusion 一致，支持 batch）。
+
+    孔洞像素逐轮从"深度最大（背景）的已填充邻居"生长，8 邻域，深度比率
+    护栏防止前景渗色。所有运算为 tensor 向量化，运行在 CUDA 上；同一批内
+    的多帧自动并行。
+
+    Args:
+        rgb: (B, 3, H, W) float32 中心 RGB（0-255）。
+        depth: (B, 1, H, W) float32 中心深度（米），孔洞处为 0。
+        valid: (B, 1, H, W) bool 有效掩码。
+
+    Returns:
+        填充后的 (rgb, depth, valid)，均为原 dtype/device。
+    """
+    dep = depth.clone()
+    col = rgb.clone()
+    filled = valid.clone()
+    if filled.all():
+        return col, dep, filled
+    offs = (
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    )
+    neg_inf = torch.tensor(float("-inf"), dtype=dep.dtype, device=dep.device)
+    for _ in range(max_iter):
+        any_nb = torch.zeros_like(filled)
+        best_d = torch.full_like(dep, neg_inf)
+        best_c = torch.zeros_like(col)
+        for dy, dx in offs:
+            d_nb = _shift_t(dep, dy, dx)
+            v_nb = _shift_t(filled.float(), dy, dx) > 0.5
+            c_nb = _shift_t(col, dy, dx)
+            any_nb = any_nb | v_nb
+            consistent = (best_d <= neg_inf) | (d_nb >= best_d * (1.0 - depth_tol))
+            sel = v_nb & consistent & (d_nb >= best_d)
+            best_d = torch.where(sel, d_nb, best_d)
+            best_c = torch.where(sel, c_nb, best_c)
+        frontier = (~filled) & any_nb
+        if not frontier.any():
+            break
+        dep = torch.where(frontier, best_d, dep)
+        col = torch.where(frontier, best_c, col)
+        filled = filled | frontier
+    return col, dep, filled
