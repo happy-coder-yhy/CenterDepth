@@ -143,12 +143,13 @@ def main() -> None:
         help="对数米制色阶上限（米，默认 20；超出部分饱和为红色）",
     )
     parser.add_argument(
-        "--temporal-median", type=int, default=15,
-        help="时间维中值滤波窗口（奇数，1=关闭；默认 15≈0.5s，压制背景模式切换抖动）",
+        "--temporal-median", type=int, default=3,
+        help="时间维中值滤波窗口（奇数，1=关闭；默认 3，只去孤立尖峰不拖影）",
     )
     parser.add_argument(
-        "--temporal-ema", type=float, default=0.15,
-        help="时间维 EMA 系数（默认 0.15，配合中值 15 帧；1=关闭）",
+        "--temporal-ema", type=float, default=0.0,
+        help="时间维 EMA：0=运动门控自适应（默认，静止 α≈0.05 不闪、运动 α≈0.9 不拖影）；"
+        ">0=固定系数；1=关闭",
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
@@ -241,8 +242,10 @@ def main() -> None:
                         alpha = args.temporal_ema
                     else:
                         md = cv2.absdiff(prev_gray, cur_gray)
-                        md = cv2.GaussianBlur(md, (5, 5), 0)
-                        alpha = 0.06 + 0.84 * np.clip(md / 12.0, 0.0, 1.0)
+                        md = cv2.GaussianBlur(md, (3, 3), 0)
+                        # 硬门控：静止(<2) α=0.05 重平滑防闪；运动(>8) α=0.9 跟随防拖影
+                        t = np.clip((md - 2.0) / 6.0, 0.0, 1.0)
+                        alpha = 0.05 + 0.85 * (t * t * (3.0 - 2.0 * t))
                     smoothed = alpha * dep_np + (1.0 - alpha) * prev_depth
                     dep_np = np.where(valid_np, smoothed, prev_depth)
                 prev_gray = cur_gray
