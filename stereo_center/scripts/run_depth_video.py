@@ -114,8 +114,12 @@ def process_batch(
 def estimate_global_vmax(
     args, model, cap, rect, fx, baseline, end: int, sample_step: int = 40
 ) -> float:
-    """采样全片帧，估计全局深度 p98（米），作为绝对米制色阶上限。"""
-    p98s = []
+    """采样全片帧，估计全局深度 p90（米），作为绝对米制色阶上限。
+
+    用 p90 而非 p98：深度图远端有大量 clip 离群值（d<0.5px → ~30m），
+    p98 会被污染导致色阶范围过大、近场被压扁；p90 更稳。
+    """
+    p90s = []
     for fidx in range(args.start_frame, end, sample_step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
         ok, img = cap.read()
@@ -128,11 +132,11 @@ def estimate_global_vmax(
         v = valid_b[0, 0].cpu().numpy()
         vals = d[v]
         if len(vals):
-            p98s.append(float(np.percentile(vals, 98)))
-    if not p98s:
+            p90s.append(float(np.percentile(vals, 90)))
+    if not p90s:
         return 2.0
-    vmax = float(np.median(p98s))
-    print(f"[vmax] 全局 p98 估计：{vmax:.2f} m（样本 {len(p98s)} 帧）")
+    vmax = float(np.median(p90s))
+    print(f"[vmax] 全局 p90 估计：{vmax:.2f} m（样本 {len(p90s)} 帧）")
     return vmax
 
 
@@ -278,7 +282,7 @@ def main() -> None:
         "color_tol": args.color_tol,
         "depth_z": bool(args.depth_z),
         "vmax_m": round(vmax, 3),
-        "vmax_source": "fixed" if args.vmax_m > 0 else "global_p98",
+        "vmax_source": "fixed" if args.vmax_m > 0 else "global_p90",
         "temporal_median": win,
         "stage_stereo_fusion_fill_seconds": round(t_stereo_fusion_fill, 2),
         "stage_other_seconds": round(max(total_s - t_stereo_fusion_fill, 0), 2),
