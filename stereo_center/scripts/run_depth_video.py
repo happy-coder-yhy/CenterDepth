@@ -249,8 +249,10 @@ def main() -> None:
                             prev_gray, cur_gray, None, **flow_params
                         )
                         yy, xx = np.mgrid[0 : dep_np.shape[0], 0 : dep_np.shape[1]]
-                        mapx = (xx - flow[..., 0]).astype(np.float32)
-                        mapy = (yy - flow[..., 1]).astype(np.float32)
+                        # Farneback(prev,cur) 的 flow 把 cur 坐标映射回 prev，
+                        # 因此 warp prev 深度到 cur 坐标要加 flow
+                        mapx = (xx + flow[..., 0]).astype(np.float32)
+                        mapy = (yy + flow[..., 1]).astype(np.float32)
                         warped = cv2.remap(
                             prev_depth, mapx, mapy,
                             cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
