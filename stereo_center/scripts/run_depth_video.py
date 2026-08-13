@@ -29,7 +29,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
-from stereo_center.visualize import colorize_depth  # noqa: E402
+from stereo_center.visualize import colorize_depth, make_depth_colorbar  # noqa: E402
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
@@ -66,6 +66,10 @@ def main() -> None:
     parser.add_argument("--occ", type=str, default="lr", choices=["lr", "visibility"])
     parser.add_argument("--color-tol", type=float, default=15.0, help="softz 颜色冲突阈值")
     parser.add_argument("--depth-z", type=int, default=1, choices=[0, 1], help="深度 hard z-buffer")
+    parser.add_argument(
+        "--vmax-m", type=float, default=2.0,
+        help="绝对米制色阶上限（米）；0=逐帧百分位色阶（旧行为）",
+    )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     args = parser.parse_args()
@@ -106,9 +110,15 @@ def main() -> None:
         fps,
         (W, H),
     )
+    if args.vmax_m > 0:
+        cv2.imwrite(str(outdir / "colorbar.png"), make_depth_colorbar(args.vmax_m, height=H))
+        print(f"[color] 绝对米制色阶 0~{args.vmax_m}m（colorbar.png 已保存）")
     print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
 
     t_all = time.time()
+    t_infer = 0.0
+    t_fusion = 0.0
+    t_fill = 0.0
     frame_idx = args.start_frame
     processed = 0
     while frame_idx < end:
@@ -144,9 +154,11 @@ def main() -> None:
             hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
         )
         infer_s = time.time() - t0
+        t_infer += infer_s
 
         # 逐帧融合 + 深度帧
         for b in range(B):
+            t0f = time.time()
             rL_bgr, rR_bgr = bgr_pairs[b]
             rR_f = photometric_align_right(rL_bgr, rR_bgr)
             dev = args.device
@@ -180,8 +192,11 @@ def main() -> None:
             rgb_np = rgb[0].permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
             dep_np = dep[0, 0].cpu().numpy()
             valid_np = valid[0, 0].cpu().numpy().astype(bool)
+            t_fusion += time.time() - t0f
+            t0fill = time.time()
             rgb_np, dep_np, valid_np = softsplat.fill_disocclusion(rgb_np, dep_np, valid_np)
-            depth_img = colorize_depth(dep_np, valid_np)  # BGR jet
+            depth_img = colorize_depth(dep_np, valid_np, vmax=args.vmax_m if args.vmax_m > 0 else None)
+            t_fill += time.time() - t0fill
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
                 cv2.imwrite(str(outdir / f"frame_{frame_idx + b:05d}.png"), depth_img)
@@ -215,6 +230,11 @@ def main() -> None:
         "avg_seconds_per_frame": round(total_s / max(processed, 1), 4),
         "color_tol": args.color_tol,
         "depth_z": bool(args.depth_z),
+        "vmax_m": args.vmax_m,
+        "stage_inference_seconds": round(t_infer, 2),
+        "stage_fusion_seconds": round(t_fusion, 2),
+        "stage_fill_seconds": round(t_fill, 2),
+        "stage_other_seconds": round(max(total_s - t_infer - t_fusion - t_fill, 0), 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")

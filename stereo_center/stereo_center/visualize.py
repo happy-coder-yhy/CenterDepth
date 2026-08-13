@@ -6,23 +6,48 @@ import cv2
 import numpy as np
 
 
-def colorize_depth(depth: np.ndarray, valid: np.ndarray) -> np.ndarray:
+def colorize_depth(
+    depth: np.ndarray, valid: np.ndarray, vmax: float | None = None
+) -> np.ndarray:
     """深度 -> jet 伪彩图（无效区域为黑色）。
 
-    归一化用 p98 百分位 + gamma 0.6：线性 jet 会把近场（小深度）压到
-    很小的色域、边缘看起来模糊；gamma 扩展近场对比，让物体边缘清晰。
+    vmax=None：逐帧 p98 百分位归一化（相对色阶，跨帧颜色不一致）；
+    vmax>0：绝对米制映射（depth/vmax），跨帧颜色与米制一一对应。
+    归一化后统一做 gamma 0.6，扩展近场（小深度）对比，让物体边缘清晰。
     """
     d = depth.copy()
     d[~valid] = np.nan
     if not np.isfinite(d).any():
         return np.zeros((*depth.shape, 3), dtype=np.uint8)
-    vmax = np.nanpercentile(d, 98)
+    if vmax is None or vmax <= 0:
+        vmax = np.nanpercentile(d, 98)
     norm = np.clip(np.nan_to_num(d / max(vmax, 1e-6), nan=0.0), 0, 1)
     norm = norm**0.6  # gamma：扩展近场（小深度）对比
     norm = (norm * 255).astype(np.uint8)
     colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
     colored[~valid] = 0
     return colored
+
+
+def make_depth_colorbar(
+    vmax: float, height: int = 600, width: int = 36, gamma: float = 0.6
+) -> np.ndarray:
+    """绝对米制色阶的竖直色条（BGR），0 ~ vmax 米，jet + 与 colorize_depth 相同的 gamma。"""
+    vals = np.linspace(0, vmax, height, dtype=np.float32)
+    norm = np.clip(vals / max(vmax, 1e-6), 0, 1) ** gamma
+    strip = (norm * 255).astype(np.uint8)[:, None]
+    bar = np.repeat(cv2.applyColorMap(strip, cv2.COLORMAP_JET), width, axis=1)
+    # 刻度标签
+    img = np.full((height, width + 46, 3), 255, np.uint8)
+    img[:, :width] = bar
+    for val in (0.0, vmax / 2.0, vmax):
+        y = int(round((1.0 - (val / max(vmax, 1e-6)) ** gamma) * (height - 1)))
+        cv2.line(img, (width - 2, y), (width + 4, y), (0, 0, 0), 1)
+        cv2.putText(
+            img, f"{val:.1f}m", (width + 8, y + 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1,
+        )
+    return img
 
 
 def colorize_map(x: np.ndarray, cmap: int = cv2.COLORMAP_JET) -> np.ndarray:
