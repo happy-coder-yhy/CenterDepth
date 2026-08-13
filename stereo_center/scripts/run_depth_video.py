@@ -148,8 +148,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--temporal-ema", type=float, default=0.0,
-        help="时间维 EMA：0=运动门控自适应（默认，静止 α≈0.05 不闪、运动 α≈0.9 不拖影）；"
-        ">0=固定系数；1=关闭",
+        help="时间维 EMA：0=光流运动补偿 EMA（默认，相机运动被补偿、无拖影）；"
+        ">0=固定系数（无光流）；1=关闭",
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
@@ -202,6 +202,8 @@ def main() -> None:
     win = max(1, args.temporal_median)
     prev_gray = None
     prev_depth = None
+    flow_params = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=3,
+                       poly_n=5, poly_sigma=1.2, flags=0)
     frame_idx = args.start_frame
     processed = 0
     while frame_idx < end:
@@ -234,20 +236,27 @@ def main() -> None:
                     d_cur = torch.median(torch.stack(list(depth_tbuf)), dim=0).values
             dep_np = d_cur[0, 0].cpu().numpy()
             valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
-            # 自适应时间 EMA：静止背景深度大幅平滑，运动区域跟随当前帧
+            # 时间 EMA：默认用光流把上一帧深度 warp 到当前帧再融合（运动补偿）
             if args.temporal_ema != 1.0:
                 cur_gray = cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
                 if prev_depth is not None and prev_gray is not None:
                     if args.temporal_ema > 0.0:
                         alpha = args.temporal_ema
+                        warped = prev_depth
                     else:
-                        md = cv2.absdiff(prev_gray, cur_gray)
-                        md = cv2.GaussianBlur(md, (3, 3), 0)
-                        # 硬门控：静止(<2) α=0.05 重平滑防闪；运动(>8) α=0.9 跟随防拖影
-                        t = np.clip((md - 2.0) / 6.0, 0.0, 1.0)
-                        alpha = 0.05 + 0.85 * (t * t * (3.0 - 2.0 * t))
-                    smoothed = alpha * dep_np + (1.0 - alpha) * prev_depth
-                    dep_np = np.where(valid_np, smoothed, prev_depth)
+                        alpha = 0.35
+                        flow = cv2.calcOpticalFlowFarneback(
+                            prev_gray, cur_gray, None, **flow_params
+                        )
+                        yy, xx = np.mgrid[0 : dep_np.shape[0], 0 : dep_np.shape[1]]
+                        mapx = (xx - flow[..., 0]).astype(np.float32)
+                        mapy = (yy - flow[..., 1]).astype(np.float32)
+                        warped = cv2.remap(
+                            prev_depth, mapx, mapy,
+                            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+                        )
+                    smoothed = alpha * dep_np + (1.0 - alpha) * warped
+                    dep_np = np.where(valid_np, smoothed, dep_np)
                 prev_gray = cur_gray
                 prev_depth = dep_np
             depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
