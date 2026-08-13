@@ -151,6 +151,14 @@ def main() -> None:
         help="时间维 EMA：0=光流运动补偿 EMA（默认，相机运动被补偿、无拖影）；"
         ">0=固定系数（无光流）；1=关闭",
     )
+    parser.add_argument(
+        "--flow-alpha", type=float, default=0.2,
+        help="光流 EMA 融合系数（默认 0.2：当前帧占 20%，历史 80%）",
+    )
+    parser.add_argument(
+        "--spatial-median", type=int, default=3,
+        help="逐帧深度空间 3x3 中值滤波核（奇数，1=关闭；默认 3 压边缘跳动）",
+    )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     args = parser.parse_args()
@@ -236,6 +244,8 @@ def main() -> None:
                     d_cur = torch.median(torch.stack(list(depth_tbuf)), dim=0).values
             dep_np = d_cur[0, 0].cpu().numpy()
             valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
+            if args.spatial_median > 1:
+                dep_np = cv2.medianBlur(dep_np, args.spatial_median)
             # 时间 EMA：默认用光流把上一帧深度 warp 到当前帧再融合（运动补偿）
             if args.temporal_ema != 1.0:
                 cur_gray = cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -244,7 +254,7 @@ def main() -> None:
                         alpha = args.temporal_ema
                         warped = prev_depth
                     else:
-                        alpha = 0.35
+                        alpha = args.flow_alpha
                         flow = cv2.calcOpticalFlowFarneback(
                             prev_gray, cur_gray, None, **flow_params
                         )
