@@ -7,8 +7,8 @@
         --scale 0.5 --batch-size 4 --outdir outputs/depth_video
 
 - 深度值恒为米制：depth = fx * baseline / disparity。
-- 色阶默认绝对米制一致：先采样估计全片 p98 作为全局上限，所有帧共用同一
-  0~vmax jet 色阶（同色=同米），并保存 colorbar.png；--vmax-m 可指定固定上限。
+- 色阶为固定对数米制映射（0.3~20m，可调）：场景深度范围大时线性色阶
+  顾此失彼，对数映射让近场/背景都有可分辨色带，且跨帧同深度同色。
 - 时间维中值滤波（默认 3 帧）抑制 WAFT 逐帧推理的深度抖动/闪烁。
 - 遮挡填充与融合都在 GPU 上批量执行。
 """
@@ -34,7 +34,10 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
 
 from stereo_center import calib, softsplat, stereo_backend, waft_inference  # noqa: E402
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
-from stereo_center.visualize import colorize_depth, make_depth_colorbar  # noqa: E402
+from stereo_center.visualize import (  # noqa: E402
+    colorize_depth_log,
+    make_depth_colorbar_log,
+)
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
@@ -111,35 +114,6 @@ def process_batch(
     return dep_b, valid_b
 
 
-def estimate_global_vmax(
-    args, model, cap, rect, fx, baseline, end: int, sample_step: int = 40
-) -> float:
-    """采样全片帧，估计全局深度 p90（米），作为绝对米制色阶上限。
-
-    用 p90 而非 p98：深度图远端有大量 clip 离群值（d<0.5px → ~30m），
-    p98 会被污染导致色阶范围过大、近场被压扁；p90 更稳。
-    """
-    p90s = []
-    for fidx in range(args.start_frame, end, sample_step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
-        ok, img = cap.read()
-        if not ok:
-            continue
-        l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
-        rL, rR = calib.rectify_pair(l_bgr, r_bgr, rect)
-        dep_b, valid_b = process_batch(model, [(rL, rR)], rect, fx, baseline, args)
-        d = dep_b[0, 0].cpu().numpy()
-        v = valid_b[0, 0].cpu().numpy()
-        vals = d[v]
-        if len(vals):
-            p90s.append(float(np.percentile(vals, 90)))
-    if not p90s:
-        return 2.0
-    vmax = float(np.median(p90s))
-    print(f"[vmax] 全局 p90 估计：{vmax:.2f} m（样本 {len(p90s)} 帧）")
-    return vmax
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="批量中心深度视频生成（米制色阶）")
     parser.add_argument("--video", type=str, required=True)
@@ -161,8 +135,12 @@ def main() -> None:
     parser.add_argument("--color-tol", type=float, default=15.0, help="softz 颜色冲突阈值")
     parser.add_argument("--depth-z", type=int, default=1, choices=[0, 1], help="深度 hard z-buffer")
     parser.add_argument(
-        "--vmax-m", type=float, default=0.0,
-        help="绝对米制色阶上限（米）；0（默认）=自动估计全片全局 p98（跨帧一致）",
+        "--dmin-m", type=float, default=0.3,
+        help="对数米制色阶下限（米，默认 0.3）",
+    )
+    parser.add_argument(
+        "--dmax-m", type=float, default=20.0,
+        help="对数米制色阶上限（米，默认 20；超出部分饱和为红色）",
     )
     parser.add_argument(
         "--temporal-median", type=int, default=3,
@@ -200,10 +178,11 @@ def main() -> None:
         end = min(end, args.start_frame + args.max_frames)
     print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
 
-    # 绝对米制色阶上限：显式指定或自动估计全片 p98（跨帧一致）
-    vmax = args.vmax_m if args.vmax_m > 0 else estimate_global_vmax(args, model, cap, rect, fx, baseline, end)
-    cv2.imwrite(str(outdir / "colorbar.png"), make_depth_colorbar(vmax, height=H))
-    print(f"[color] 绝对米制色阶 0~{vmax:.2f}m（全片固定，colorbar.png 已保存）")
+    cv2.imwrite(
+        str(outdir / "colorbar.png"),
+        make_depth_colorbar_log(args.dmin_m, args.dmax_m, height=H),
+    )
+    print(f"[color] 对数米制色阶 {args.dmin_m}~{args.dmax_m}m（全片固定，colorbar.png 已保存）")
 
     writer = cv2.VideoWriter(
         str(outdir / args.video_name),
@@ -247,7 +226,7 @@ def main() -> None:
                     d_cur = torch.median(torch.stack(list(depth_tbuf)), dim=0).values
             dep_np = d_cur[0, 0].cpu().numpy()
             valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
-            depth_img = colorize_depth(dep_np, valid_np, vmax=vmax)
+            depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
                 cv2.imwrite(str(outdir / f"frame_{frame_idx + b:05d}.png"), depth_img)
@@ -281,8 +260,9 @@ def main() -> None:
         "avg_seconds_per_frame": round(total_s / max(processed, 1), 4),
         "color_tol": args.color_tol,
         "depth_z": bool(args.depth_z),
-        "vmax_m": round(vmax, 3),
-        "vmax_source": "fixed" if args.vmax_m > 0 else "global_p90",
+        "colormap": "log_metric",
+        "dmin_m": args.dmin_m,
+        "dmax_m": args.dmax_m,
         "temporal_median": win,
         "stage_stereo_fusion_fill_seconds": round(t_stereo_fusion_fill, 2),
         "stage_other_seconds": round(max(total_s - t_stereo_fusion_fill, 0), 2),

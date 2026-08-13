@@ -50,6 +50,57 @@ def make_depth_colorbar(
     return img
 
 
+def colorize_depth_log(
+    depth: np.ndarray,
+    valid: np.ndarray,
+    d_min: float = 0.3,
+    d_max: float = 20.0,
+    gamma: float = 0.6,
+) -> np.ndarray:
+    """对数尺度绝对米制色阶：norm = (log10(d) - log10(d_min)) / (log10(d_max) - log10(d_min))。
+
+    场景深度范围大（近场 0.5m ~ 背景 30m）时，线性色阶会顾此失彼；
+    对数色阶让近场和背景都有可分辨的色带，且映射固定 → 跨帧同深度同色。
+    """
+    d = np.asarray(depth, dtype=np.float32).copy()
+    d[~valid] = np.nan
+    if not np.isfinite(d).any():
+        return np.zeros((*depth.shape, 3), dtype=np.uint8)
+    lo, hi = np.log10(max(d_min, 1e-3)), np.log10(max(d_max, d_min + 1e-3))
+    norm = (np.log10(np.clip(d, d_min, d_max)) - lo) / (hi - lo)
+    norm = np.clip(np.nan_to_num(norm, nan=0.0), 0, 1) ** gamma
+    colored = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    colored[~valid] = 0
+    return colored
+
+
+def make_depth_colorbar_log(
+    d_min: float = 0.3,
+    d_max: float = 20.0,
+    height: int = 600,
+    width: int = 36,
+    gamma: float = 0.6,
+) -> np.ndarray:
+    """对数米制色阶竖直色条（BGR），刻度为米（对数间隔）。"""
+    lo, hi = np.log10(max(d_min, 1e-3)), np.log10(max(d_max, d_min + 1e-3))
+    ticks = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
+    ticks = [t for t in ticks if d_min <= t <= d_max]
+    vals = np.linspace(lo, hi, height, dtype=np.float32)
+    norm = ((vals - lo) / (hi - lo)) ** gamma
+    strip = (norm * 255).astype(np.uint8)[:, None]
+    bar = np.repeat(cv2.applyColorMap(strip, cv2.COLORMAP_JET), width, axis=1)
+    img = np.full((height, width + 52, 3), 255, np.uint8)
+    img[:, :width] = bar
+    for t in ticks:
+        y = int(round((1.0 - ((np.log10(t) - lo) / (hi - lo)) ** gamma) * (height - 1)))
+        cv2.line(img, (width - 2, y), (width + 4, y), (0, 0, 0), 1)
+        cv2.putText(
+            img, f"{t:g}m", (width + 8, y + 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1,
+        )
+    return img
+
+
 def colorize_map(x: np.ndarray, cmap: int = cv2.COLORMAP_JET) -> np.ndarray:
     """任意单通道图 -> 归一化伪彩图。"""
     norm = cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
