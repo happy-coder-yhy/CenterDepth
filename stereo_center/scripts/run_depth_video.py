@@ -140,39 +140,35 @@ def process_batch(
         dL = torch.from_numpy(dL)
         dR = torch.from_numpy(dR) if dR is not None else None
     dev = args.device
-    fusion_out = []
-    for b in range(B):
-        rL_bgr, rR_bgr = bgr_pairs[b]
-        rR_f = photometric_align_right(rL_bgr, rR_bgr)
-        left_f = (
-            torch.from_numpy(cv2.cvtColor(rL_bgr, cv2.COLOR_BGR2RGB))
-            .permute(2, 0, 1).float().unsqueeze(0).to(dev)
-        )
-        right_f = (
-            torch.from_numpy(cv2.cvtColor(rR_f, cv2.COLOR_BGR2RGB))
-            .permute(2, 0, 1).float().unsqueeze(0).to(dev)
-        )
-        dl = dL[b].unsqueeze(0).unsqueeze(0).to(dev)
-        if dR is not None:
-            dr = dR[b].unsqueeze(0).unsqueeze(0).to(dev)
-            cr = confR[b].unsqueeze(0).unsqueeze(0).to(dev)
-            orr = occR[b].unsqueeze(0).unsqueeze(0).to(dev)
-        else:
-            dr = cr = orr = None
-        cl = confL[b].unsqueeze(0).unsqueeze(0).to(dev)
-        ol = occL[b].unsqueeze(0).unsqueeze(0).to(dev)
-        rgb, dep, valid = softsplat.center_view(
-            left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
-            disp_right=dr, conf_right=cr, occ_right=orr,
-            edge_k=1.5, blend="softz", weight_mode="expdecay", weight_k=4.0,
-            median_k=args.median_k,
-            depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
-            color_tol=args.color_tol,
-        )
-        fusion_out.append((rgb, dep, valid))
-    rgb_b = torch.cat([x[0] for x in fusion_out], dim=0)
-    dep_b = torch.cat([x[1] for x in fusion_out], dim=0)
-    valid_b = torch.cat([x[2] for x in fusion_out], dim=0)
+    # 保持逐帧光度校正，但将中心视角融合本身一次性按 B 帧执行，
+    # 避免每帧重复创建投影网格、权重和 z-buffer 中间张量。
+    right_f_cpu = torch.stack([
+        torch.from_numpy(
+            cv2.cvtColor(
+                photometric_align_right(rL_bgr, rR_bgr), cv2.COLOR_BGR2RGB
+            )
+        ).permute(2, 0, 1).float()
+        for rL_bgr, rR_bgr in bgr_pairs
+    ])
+    left_f = left_t.to(dev)
+    right_f = right_f_cpu.to(dev)
+    dl = dL.unsqueeze(1).to(dev)
+    cl = confL.unsqueeze(1).to(dev)
+    ol = occL.unsqueeze(1).to(dev)
+    if dR is not None:
+        dr = dR.unsqueeze(1).to(dev)
+        cr = confR.unsqueeze(1).to(dev)
+        orr = occR.unsqueeze(1).to(dev)
+    else:
+        dr = cr = orr = None
+    rgb_b, dep_b, valid_b = softsplat.center_view(
+        left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
+        disp_right=dr, conf_right=cr, occ_right=orr,
+        edge_k=1.5, blend="softz", weight_mode="expdecay", weight_k=4.0,
+        median_k=args.median_k,
+        depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
+        color_tol=args.color_tol,
+    )
     rgb_b, dep_b, valid_b = softsplat.fill_disocclusion_torch(rgb_b, dep_b, valid_b)
     if args.depth_gf:
         # 中心 RGB 引导滤波：深度边缘对齐到图像边缘，提升锐度
