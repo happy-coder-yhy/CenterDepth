@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 import sys
 import os
+from pathlib import Path
 from peft import LoraConfig, get_peft_model
 from einops import rearrange
 from thirdparty.DepthAnythingV2.depth_anything_v2.dpt import DepthAnythingV2
@@ -17,15 +18,50 @@ DEPTH_ANYTHING_CONFIGS = {
     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
 }
+
+MODULE_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _resolve_depth_anything_ckpt(model_name: str) -> Path | None:
+    """查找 Depth Anything V2 预训练权重。
+
+    兼容旧的 `depth-anything-ckpts/` 目录，同时优先使用仓库内统一管理的
+    `weights/depth-anything-ckpts/`。这样权重不再依赖当前工作目录。
+    """
+    ckpt_name = f"depth_anything_v2_{model_name}.pth"
+    env_dir = os.environ.get("DAV2_CKPT_DIR")
+    candidates = []
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser() / ckpt_name)
+    candidates.extend([
+        MODULE_ROOT / "weights" / "depth-anything-ckpts" / ckpt_name,
+        MODULE_ROOT / "weights" / "pretrain_weights" / ckpt_name,
+        MODULE_ROOT / "depth-anything-ckpts" / ckpt_name,
+        Path.cwd() / "depth-anything-ckpts" / ckpt_name,
+    ])
+    for ckpt in candidates:
+        if ckpt.exists():
+            return ckpt
+    return None
+
+
 class DAv2Encoder(nn.Module):
     def __init__(self, model_name='vits', alpha=None, r=None):
         super().__init__()
         self.model_name = model_name
         depth_anything = DepthAnythingV2(**DEPTH_ANYTHING_CONFIGS[model_name])
-        if os.path.exists(f'depth-anything-ckpts/depth_anything_v2_{model_name}.pth'):
-            depth_anything.load_state_dict(torch.load(f'depth-anything-ckpts/depth_anything_v2_{model_name}.pth', map_location='cpu'))
+        ckpt_path = _resolve_depth_anything_ckpt(model_name)
+        if ckpt_path is not None:
+            depth_anything.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
         else:
-            print(f"Warning: checkpoint for depth anything v2 {model_name} not found, using random weights.")
+            print(
+                f"Warning: checkpoint for depth anything v2 {model_name} not found, "
+                f"using random weights. Searched: "
+                f"{MODULE_ROOT / 'weights' / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}, "
+                f"{MODULE_ROOT / 'weights' / 'pretrain_weights' / f'depth_anything_v2_{model_name}.pth'}, "
+                f"{MODULE_ROOT / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}, "
+                f"{Path.cwd() / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}"
+            )
         self.dpt_configs = {
             'vitl': {'n_layers': 24, "dim": 1024},
             'vitb': {'n_layers': 12, "dim": 768},
