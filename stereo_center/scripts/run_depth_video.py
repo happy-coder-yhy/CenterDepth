@@ -88,7 +88,7 @@ def process_batch(
     fx: float,
     baseline: float,
     args,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     """校正后 BGR 对列表 → GPU 批量推理 + 融合 + 遮挡填充。
 
     Returns:
@@ -96,6 +96,14 @@ def process_batch(
         valid_b: (B, 1, H, W) bool GPU 有效掩码；
         rgb_b: (B, 3, H, W) float32 GPU 中心 RGB（0-255）。
     """
+    timing = {
+        "waft_forward": 0.0,
+        "photo_align": 0.0,
+        "center_fusion": 0.0,
+        "fill": 0.0,
+        "depth_gf": 0.0,
+    }
+
     B = len(bgr_pairs)
     H, W = bgr_pairs[0][0].shape[:2]
     left_t = torch.zeros(B, 3, H, W)
@@ -108,27 +116,35 @@ def process_batch(
         from stereo_center import waft_inference  # noqa: E402  # 懒加载：仅 waft 路径需要 peft 等
 
         if args.bi:
+            t0 = time.perf_counter()
             dL, dR, occL, occR, confL, confR, _ = waft_inference.run_stereo_matching_bi_batch(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
             )
+            timing["waft_forward"] += time.perf_counter() - t0
         else:
+            t0 = time.perf_counter()
             dL, occL, confL, _ = waft_inference.run_stereo_matching(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode="ones", occ_mode="visibility",
             )
+            timing["waft_forward"] += time.perf_counter() - t0
             dR = occR = confR = None
     else:
         if args.bi:
+            t0 = time.perf_counter()
             dL, dR, occL, occR, confL, confR, _ = stereo_backend.run_bi_batch(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
             )
+            timing["waft_forward"] += time.perf_counter() - t0
         else:
+            t0 = time.perf_counter()
             dL, occL, confL, _ = stereo_backend.run(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
             )
+            timing["waft_forward"] += time.perf_counter() - t0
             dR = occR = confR = None
     if args.guided_filter:
         from stereo_center.guided_filter import guided_filter_batch  # noqa: E402
@@ -142,6 +158,7 @@ def process_batch(
     dev = args.device
     # 保持逐帧光度校正，但将中心视角融合本身一次性按 B 帧执行，
     # 避免每帧重复创建投影网格、权重和 z-buffer 中间张量。
+    t0 = time.perf_counter()
     right_f_cpu = torch.stack([
         torch.from_numpy(
             cv2.cvtColor(
@@ -150,6 +167,7 @@ def process_batch(
         ).permute(2, 0, 1).float()
         for rL_bgr, rR_bgr in bgr_pairs
     ])
+    timing["photo_align"] += time.perf_counter() - t0
     left_f = left_t.to(dev)
     right_f = right_f_cpu.to(dev)
     dl = dL.unsqueeze(1).to(dev)
@@ -161,6 +179,7 @@ def process_batch(
         orr = occR.unsqueeze(1).to(dev)
     else:
         dr = cr = orr = None
+    t0 = time.perf_counter()
     rgb_b, dep_b, valid_b = softsplat.center_view(
         left_f, right_f, dl, cl, ol, fx=fx, baseline=baseline,
         disp_right=dr, conf_right=cr, occ_right=orr,
@@ -169,10 +188,14 @@ def process_batch(
         depth_z=bool(args.depth_z), depth_z_thresh=0.05, depth_z_power=2.0,
         color_tol=args.color_tol,
     )
+    timing["center_fusion"] += time.perf_counter() - t0
+    t0 = time.perf_counter()
     rgb_b, dep_b, valid_b = softsplat.fill_disocclusion_torch(rgb_b, dep_b, valid_b)
+    timing["fill"] += time.perf_counter() - t0
     if args.depth_gf:
         # 中心 RGB 引导滤波：深度边缘对齐到图像边缘，提升锐度
         dev = args.device
+        t0 = time.perf_counter()
         for b in range(B):
             c_rgb = rgb_b[b].permute(1, 2, 0).cpu().numpy()
             c_gray = cv2.cvtColor(c_rgb, cv2.COLOR_RGB2GRAY)
@@ -182,7 +205,8 @@ def process_batch(
                 # 边缘保留 unsharp：仅在有图像边缘处增强
                 q = dep_np + args.depth_unsharp * (dep_np - q)
             dep_b[b, 0] = torch.from_numpy(q).to(dev)
-    return dep_b, valid_b, rgb_b
+        timing["depth_gf"] += time.perf_counter() - t0
+    return dep_b, valid_b, rgb_b, timing
 
 
 def main() -> None:
@@ -253,10 +277,23 @@ def main() -> None:
     parser.add_argument("--save-depth-npy", type=int, default=0, help="每帧额外保存米制深度 npy（供后处理时间平滑）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     args = parser.parse_args()
+    t_program = time.perf_counter()
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
+
+    t_model_load = 0.0
+    t_decode = 0.0
+    t_rectify = 0.0
+    t_waft = 0.0
+    t_align = 0.0
+    t_fusion = 0.0
+    t_fill = 0.0
+    t_depth_gf = 0.0
+    t_color = 0.0
+    t_write = 0.0
+    t_png_write = 0.0
 
     cal = calib.load_vdego_calibration(args.calib)
     out_size = (
@@ -271,11 +308,13 @@ def main() -> None:
 
     weights_dir = resolve_weights_dir(args.weights, backend)
     print(f"[weights] {weights_dir}")
+    t0 = time.perf_counter()
     model = stereo_backend.load(
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
         iters=args.waft_iters,
     )
+    t_model_load += time.perf_counter() - t0
     raft = None
     if args.temporal_raft:
         raft_weights = (
@@ -308,7 +347,6 @@ def main() -> None:
     )
 
     t_all = time.time()
-    t_stereo_fusion_fill = 0.0
     depth_tbuf = deque(maxlen=max(1, args.temporal_median))
     win = max(1, args.temporal_median)
     prev_gray = None
@@ -321,23 +359,30 @@ def main() -> None:
     processed = 0
     while frame_idx < end:
         batch_frames = []
+        t0 = time.perf_counter()
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         for _ in range(min(args.batch_size, end - frame_idx)):
             ok, img = cap.read()
             if not ok:
                 break
             batch_frames.append(img)
+        t_decode += time.perf_counter() - t0
         if not batch_frames:
             break
         B = len(batch_frames)
 
         bgr_pairs = []
+        t0 = time.perf_counter()
         for img in batch_frames:
             l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
             bgr_pairs.append(calib.rectify_pair(l_bgr, r_bgr, rect))
-        t0 = time.time()
-        dep_b, valid_b, _rgb_b = process_batch(model, bgr_pairs, rect, fx, baseline, args)
-        t_stereo_fusion_fill += time.time() - t0
+        t_rectify += time.perf_counter() - t0
+        dep_b, valid_b, _rgb_b, timing = process_batch(model, bgr_pairs, rect, fx, baseline, args)
+        t_waft += timing["waft_forward"]
+        t_align += timing["photo_align"]
+        t_fusion += timing["center_fusion"]
+        t_fill += timing["fill"]
+        t_depth_gf += timing["depth_gf"]
 
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
@@ -415,15 +460,21 @@ def main() -> None:
                     dep_np = np.where(valid_np, smoothed, dep_np)
                 prev_gray = cur_gray
                 prev_depth = dep_np
+            t0 = time.perf_counter()
             depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
+            t_color += time.perf_counter() - t0
+            t0 = time.perf_counter()
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
+                t_png0 = time.perf_counter()
                 cv2.imwrite(str(outdir / f"frame_{frame_idx + b:05d}.png"), depth_img)
+                t_png_write += time.perf_counter() - t_png0
             if args.save_depth_npy:
                 np.save(
                     str(outdir / f"depth_{frame_idx + b:06d}.npy"),
                     dep_np.astype(np.float32),
                 )
+            t_write += time.perf_counter() - t0
             processed += 1
 
         frame_idx += B
@@ -439,6 +490,8 @@ def main() -> None:
     writer.release()
     cap.release()
     total_s = time.time() - t_all
+    e2e_s = time.perf_counter() - t_program
+    proc_s = t_waft + t_align + t_fusion + t_fill + t_depth_gf + t_color + t_write
     stats = {
         "video": str(args.video),
         "scale": args.scale,
@@ -454,6 +507,7 @@ def main() -> None:
         "fps": fps,
         "size": [W, H],
         "total_seconds": round(total_s, 2),
+        "end_to_end_seconds": round(e2e_s, 2),
         "avg_seconds_per_frame": round(total_s / max(processed, 1), 4),
         "color_tol": args.color_tol,
         "median_k": args.median_k,
@@ -472,11 +526,34 @@ def main() -> None:
         "dmax_m": args.dmax_m,
         "temporal_median": win,
         "temporal_ema": args.temporal_ema,
-        "stage_stereo_fusion_fill_seconds": round(t_stereo_fusion_fill, 2),
-        "stage_other_seconds": round(max(total_s - t_stereo_fusion_fill, 0), 2),
+        "stage_model_load_seconds": round(t_model_load, 2),
+        "stage_video_decode_locate_seconds": round(t_decode, 2),
+        "stage_stereo_rectify_seconds": round(t_rectify, 2),
+        "stage_waft_forward_seconds": round(t_waft, 2),
+        "stage_photometric_align_seconds": round(t_align, 2),
+        "stage_center_fusion_seconds": round(t_fusion, 2),
+        "stage_disocclusion_fill_seconds": round(t_fill, 2),
+        "stage_depth_gf_seconds": round(t_depth_gf, 2),
+        "stage_depth_colorize_seconds": round(t_color, 2),
+        "stage_video_write_seconds": round(t_write, 2),
+        "stage_png_write_seconds": round(t_png_write, 2),
+        "stage_stereo_fusion_fill_seconds": round(t_waft + t_align + t_fusion + t_fill + t_depth_gf, 2),
+        "stage_main_process_seconds": round(proc_s, 2),
+        "stage_other_seconds": round(max(total_s - proc_s, 0), 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")
+    print(f"[timing] 模型加载 {t_model_load:.2f}s")
+    print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
+    print(f"[timing] 双目校正 {t_rectify:.2f}s")
+    print(f"[timing] WAFT 双向前向 {t_waft:.2f}s")
+    print(f"[timing] 双目光度对齐 {t_align:.2f}s")
+    print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
+    print(f"[timing] 遮挡补洞 {t_fill:.2f}s")
+    print(f"[timing] 深度着色 {t_color:.2f}s")
+    print(f"[timing] 视频写盘 {t_write:.2f}s（其中 PNG {t_png_write:.2f}s）")
+    print(f"[timing] 脚本总耗时 {total_s:.2f}s")
+    print(f"[timing] 端到端耗时 {e2e_s:.2f}s")
     print(f"[out] {outdir / args.video_name}")
 
 
