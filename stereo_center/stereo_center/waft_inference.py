@@ -43,6 +43,7 @@ def load_waft(
     model_type: str = "DAv2L-5",
     weights_dir: str | Path = "weights/waft",
     device: str = "cuda",
+    iters: int | None = None,
 ) -> WAFT:
     """加载 WAFT-Stereo 预训练权重（ckpt 内含完整权重，无需另下 DAv2）。"""
     if model_type not in WAFT_MODEL_CONFIG:
@@ -59,6 +60,8 @@ def load_waft(
 
     cfg = get_cfg()
     cfg.merge_from_file(str(WAFT_ROOT / WAFT_MODEL_CONFIG[model_type]))
+    if iters is not None:
+        cfg.WAFT.ITERATIVE_MODULE.TASK = ["delta"] * int(iters)
     cfg.freeze()
     model = WAFT(cfg)
 
@@ -71,7 +74,7 @@ def load_waft(
             module.merge_and_unload()
 
     model.eval().to(device)
-    print(f"[waft] {model_type} 权重加载完成: {ckpt_path}")
+    print(f"[waft] {model_type} 权重加载完成: {ckpt_path} (iters={len(cfg.WAFT.ITERATIVE_MODULE.TASK)})")
     return model
 
 
@@ -92,14 +95,33 @@ def _run_once(
     else:
         forward = lambda: model(sample)
 
-    t0 = time.time()
+    if left.device.type == "cuda":
+        torch.cuda.synchronize(left.device)
+    t0 = time.perf_counter()
     if use_amp and left.device.type == "cuda":
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = forward()
     else:
         out = forward()
-    elapsed = time.time() - t0
+    if left.device.type == "cuda":
+        torch.cuda.synchronize(left.device)
+    elapsed = time.perf_counter() - t0
     return out, elapsed
+
+
+def _run_bidirectional_once(
+    model: WAFT,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    hiera_mode: str,
+    use_amp: bool,
+) -> tuple[dict, int, float]:
+    """把左右两个方向拼为一个 2B 前向，减少一次模型调度和重复开销。"""
+    batch = left.shape[0]
+    left_bi = torch.cat((left, torch.flip(right, dims=[3])), dim=0)
+    right_bi = torch.cat((right, torch.flip(left, dims=[3])), dim=0)
+    out, elapsed = _run_once(model, left_bi, right_bi, hiera_mode, use_amp)
+    return out, batch, elapsed
 
 
 def _visibility_mask(disp: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -116,27 +138,36 @@ def _lr_error(
     disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """左右一致性误差 |dL - dR(x-dL)| 与右图内坐标 x-dL。"""
-    dL = disp_l[0]
-    dR = disp_r[0]
+    diff, tx = _lr_error_batch(disp_l, disp_r, H, W)
+    return diff[0], tx[0]
+
+
+def _lr_error_batch(
+    disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """批量计算左右一致性误差，避免逐帧调用 grid_sample。"""
+    dL = disp_l
+    dR = disp_r
     yy, xx = torch.meshgrid(
         torch.arange(H, device=dL.device),
         torch.arange(W, device=dL.device),
         indexing="ij",
     )
-    tx = xx - dL
+    tx = xx.unsqueeze(0) - dL
     grid = torch.stack(
-        [2.0 * tx / max(W - 1, 1) - 1.0, 2.0 * yy / max(H - 1, 1) - 1.0],
+        [2.0 * tx / max(W - 1, 1) - 1.0,
+         2.0 * yy.unsqueeze(0).expand_as(tx) / max(H - 1, 1) - 1.0],
         dim=-1,
-    ).unsqueeze(0)
+    )
     dR_at_l = F.grid_sample(
-        dR.unsqueeze(0).unsqueeze(0),
+        dR.unsqueeze(1),
         grid,
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True,
-    )[0, 0]
+    )[:, 0]
     diff = (dL - dR_at_l).abs()
-    return diff, xx - dL
+    return diff, tx
 
 
 def _lr_consistency_mask(
@@ -160,6 +191,32 @@ def _lr_confidence(
     return conf * (tx >= 0).float()
 
 
+def _lr_consistency_mask_batch(
+    disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
+) -> torch.Tensor:
+    diff, tx = _lr_error_batch(disp_l, disp_r, H, W)
+    thresh = torch.maximum(torch.ones_like(disp_l), 0.05 * disp_l)
+    return ((diff < thresh) & (tx >= 0)).float()
+
+
+def _lr_confidence_batch(
+    disp_l: torch.Tensor, disp_r: torch.Tensor, H: int, W: int
+) -> torch.Tensor:
+    diff, tx = _lr_error_batch(disp_l, disp_r, H, W)
+    thresh = torch.maximum(torch.ones_like(disp_l), 0.05 * disp_l)
+    conf = torch.exp(-diff / thresh.clamp_min(1e-3))
+    return conf * (tx >= 0).float()
+
+
+def _visibility_mask_batch(disp: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    _, xx = torch.meshgrid(
+        torch.arange(H, device=disp.device),
+        torch.arange(W, device=disp.device),
+        indexing="ij",
+    )
+    return (xx.unsqueeze(0) - disp >= 0).float()
+
+
 def _resolve_hiera(hiera: str, H: int, W: int) -> str:
     """auto：max(H,W)>1080 用 0.5->1.0 分层，否则直接 forward。"""
     if hiera == "auto":
@@ -173,6 +230,12 @@ def _conf_from_info(info: torch.Tensor, conf_mode: str, disp: torch.Tensor) -> t
         return torch.ones_like(disp[0])
     weight = info[:, :2].softmax(dim=1)
     return weight[0, 0]
+
+
+def _conf_from_info_batch(info: torch.Tensor, conf_mode: str, disp: torch.Tensor) -> torch.Tensor:
+    if conf_mode == "ones":
+        return torch.ones_like(disp)
+    return info[:, :2].softmax(dim=1)[:, 0]
 
 
 @torch.no_grad()
@@ -209,24 +272,19 @@ def run_stereo_matching(
 
     lt = left.to(device)
     rt = right.to(device)
-    out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
-    disp = out_l["disp_pred"]  # (B, H, W)
-    info = out_l["delta_info_preds"][-1]  # (B, 4, H, W)
-
     need_r = (occ_mode == "lr") or (conf_mode == "lr")
     if need_r:
-        # 正值约束模型：右参考必须水平翻转+交换输入，否则 dR 为半尺度垃圾值
-        out_r, t2 = _run_once(
-            model,
-            torch.flip(rt, dims=[3]),
-            torch.flip(lt, dims=[3]),
-            hiera_mode,
-            use_amp,
+        # 正值约束模型：右参考必须水平翻转+交换输入，否则 dR 为半尺度垃圾值。
+        out_bi, batch, elapsed = _run_bidirectional_once(
+            model, lt, rt, hiera_mode, use_amp
         )
-        dR = torch.flip(out_r["disp_pred"], dims=[2])  # 翻回原右图坐标
-        elapsed = t1 + t2
+        disp = out_bi["disp_pred"][:batch]
+        dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])
+        info = out_bi["delta_info_preds"][-1][:batch]
     else:
-        elapsed = t1
+        out_l, elapsed = _run_once(model, lt, rt, hiera_mode, use_amp)
+        disp = out_l["disp_pred"]
+        info = out_l["delta_info_preds"][-1]
     if occ_mode == "lr":
         occ = _lr_consistency_mask(disp, dR, H, W)
     else:
@@ -271,28 +329,24 @@ def run_stereo_matching_bi(
 
     lt = left.to(device)
     rt = right.to(device)
-    out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
-    out_r, t2 = _run_once(
-        model,
-        torch.flip(rt, dims=[3]),
-        torch.flip(lt, dims=[3]),
-        hiera_mode,
-        use_amp,
+    out_bi, batch, elapsed = _run_bidirectional_once(
+        model, lt, rt, hiera_mode, use_amp
     )
-    dL = out_l["disp_pred"]
-    dR = torch.flip(out_r["disp_pred"], dims=[2])  # (B, H, W)，翻回原右图坐标
+    dL = out_bi["disp_pred"][:batch]
+    dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])  # 翻回原右图坐标
     if occ_mode == "visibility":
         occL = _visibility_mask(dL, H, W)
         occR = _visibility_mask(dR, H, W)
     else:
         occL = _lr_consistency_mask(dL, dR, H, W)
         occR = _lr_consistency_mask(dR, dL, H, W)
-    infoR = torch.flip(out_r["delta_info_preds"][-1], dims=[3])  # (B, 4, H, W)
+    infoL = out_bi["delta_info_preds"][-1][:batch]
+    infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
     if conf_mode == "lr":
         confL = _lr_confidence(dL, dR, H, W)
         confR = _lr_confidence(dR, dL, H, W)
     else:
-        confL = _conf_from_info(out_l["delta_info_preds"][-1], conf_mode, dL)
+        confL = _conf_from_info(infoL, conf_mode, dL)
         confR = _conf_from_info(infoR, conf_mode, dR)
     return (
         dL[0].float().cpu(),
@@ -301,7 +355,7 @@ def run_stereo_matching_bi(
         occR.float().cpu(),
         confL.float().cpu(),
         confR.float().cpu(),
-        t1 + t2,
+        elapsed,
     )
 
 
@@ -326,37 +380,31 @@ def run_stereo_matching_bi_batch(
     """
     H, W = left.shape[-2:]
     hiera_mode = _resolve_hiera(hiera, H, W)
+    if hiera_mode not in ("direct", "hiera"):
+        raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
+    if conf_mode not in ("info", "ones", "lr"):
+        raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones/lr）")
+    if occ_mode not in ("lr", "visibility"):
+        raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
     lt = left.to(device)
     rt = right.to(device)
-    out_l, t1 = _run_once(model, lt, rt, hiera_mode, use_amp)
-    out_r, t2 = _run_once(
-        model,
-        torch.flip(rt, dims=[3]),
-        torch.flip(lt, dims=[3]),
-        hiera_mode,
-        use_amp,
+    out_bi, batch, elapsed = _run_bidirectional_once(
+        model, lt, rt, hiera_mode, use_amp
     )
-    dL = out_l["disp_pred"].float()  # (B, H, W)
-    dR = torch.flip(out_r["disp_pred"], dims=[2]).float()
-    B = dL.shape[0]
-    occL = torch.zeros_like(dL)
-    occR = torch.zeros_like(dL)
-    confL = torch.zeros_like(dL)
-    confR = torch.zeros_like(dL)
-    infoR = torch.flip(out_r["delta_info_preds"][-1], dims=[3])
-    for b in range(B):
-        l1 = dL[b].unsqueeze(0)
-        r1 = dR[b].unsqueeze(0)
-        if occ_mode == "visibility":
-            occL[b] = _visibility_mask(l1, H, W)
-            occR[b] = _visibility_mask(r1, H, W)
-        else:
-            occL[b] = _lr_consistency_mask(l1, r1, H, W)
-            occR[b] = _lr_consistency_mask(r1, l1, H, W)
-        if conf_mode == "lr":
-            confL[b] = _lr_confidence(l1, r1, H, W)
-            confR[b] = _lr_confidence(r1, l1, H, W)
-        else:
-            confL[b] = _conf_from_info(out_l["delta_info_preds"][-1][b : b + 1], conf_mode, l1)
-            confR[b] = _conf_from_info(infoR[b : b + 1], conf_mode, r1)
-    return dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), t1 + t2
+    dL = out_bi["disp_pred"][:batch].float()
+    dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2]).float()
+    infoL = out_bi["delta_info_preds"][-1][:batch]
+    infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
+    if occ_mode == "visibility":
+        occL = _visibility_mask_batch(dL, H, W)
+        occR = _visibility_mask_batch(dR, H, W)
+    else:
+        occL = _lr_consistency_mask_batch(dL, dR, H, W)
+        occR = _lr_consistency_mask_batch(dR, dL, H, W)
+    if conf_mode == "lr":
+        confL = _lr_confidence_batch(dL, dR, H, W)
+        confR = _lr_confidence_batch(dR, dL, H, W)
+    else:
+        confL = _conf_from_info_batch(infoL, conf_mode, dL)
+        confR = _conf_from_info_batch(infoR, conf_mode, dR)
+    return dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), elapsed
