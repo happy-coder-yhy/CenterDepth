@@ -98,6 +98,8 @@ def process_batch(
     """
     timing = {
         "waft_forward": 0.0,
+        "waft_total": 0.0,
+        "waft_detail": None,
         "photo_align": 0.0,
         "center_fusion": 0.0,
         "fill": 0.0,
@@ -116,19 +118,25 @@ def process_batch(
         from stereo_center import waft_inference  # noqa: E402  # 懒加载：仅 waft 路径需要 peft 等
 
         if args.bi:
-            t0 = time.perf_counter()
+            waft_detail = {}
             dL, dR, occL, occR, confL, confR, _ = waft_inference.run_stereo_matching_bi_batch(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
+                timing_out=waft_detail,
             )
-            timing["waft_forward"] += time.perf_counter() - t0
+            timing["waft_forward"] += waft_detail.get("model_forward_seconds", 0.0)
+            timing["waft_total"] += waft_detail.get("waft_total_seconds", 0.0)
+            timing["waft_detail"] = waft_detail
         else:
-            t0 = time.perf_counter()
+            waft_detail = {}
             dL, occL, confL, _ = waft_inference.run_stereo_matching(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode="ones", occ_mode="visibility",
+                timing_out=waft_detail,
             )
-            timing["waft_forward"] += time.perf_counter() - t0
+            timing["waft_forward"] += waft_detail.get("model_forward_seconds", 0.0)
+            timing["waft_total"] += waft_detail.get("waft_total_seconds", 0.0)
+            timing["waft_detail"] = waft_detail
             dR = occR = confR = None
     else:
         if args.bi:
@@ -294,6 +302,7 @@ def main() -> None:
     t_color = 0.0
     t_write = 0.0
     t_png_write = 0.0
+    waft_timing_records = []
 
     cal = calib.load_vdego_calibration(args.calib)
     out_size = (
@@ -383,6 +392,19 @@ def main() -> None:
         t_fusion += timing["center_fusion"]
         t_fill += timing["fill"]
         t_depth_gf += timing["depth_gf"]
+        if timing.get("waft_detail") is not None:
+            waft_timing_records.append({
+                "batch_index": len(waft_timing_records),
+                "start_frame": frame_idx,
+                "end_frame": frame_idx + B,
+                "batch_size": B,
+                "model_samples": 2 * B if args.bi else B,
+                "stages_seconds": {
+                    key: round(float(value), 6)
+                    for key, value in timing["waft_detail"].items()
+                    if isinstance(value, (int, float))
+                },
+            })
 
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
@@ -492,6 +514,39 @@ def main() -> None:
     total_s = time.time() - t_all
     e2e_s = time.perf_counter() - t_program
     proc_s = t_waft + t_align + t_fusion + t_fill + t_depth_gf + t_color + t_write
+    waft_stage_seconds = {}
+    for record in waft_timing_records:
+        for key, value in record["stages_seconds"].items():
+            waft_stage_seconds[key] = waft_stage_seconds.get(key, 0.0) + value
+    waft_total_s = waft_stage_seconds.get("waft_total_seconds", 0.0)
+    waft_model_s = waft_stage_seconds.get("model_forward_seconds", 0.0)
+    waft_timing = {
+        "video": str(args.video),
+        "backend": backend,
+        "model_type": args.model_type,
+        "bidirectional": bool(args.bi),
+        "batch_size": args.batch_size,
+        "n_frames": processed,
+        "n_batches": len(waft_timing_records),
+        "model_samples": sum(record["model_samples"] for record in waft_timing_records),
+        "stage_seconds": {key: round(value, 6) for key, value in waft_stage_seconds.items()},
+        "average_seconds_per_batch": {
+            key: round(value / max(len(waft_timing_records), 1), 6)
+            for key, value in waft_stage_seconds.items()
+        },
+        "average_seconds_per_frame": {
+            key: round(value / max(processed, 1), 6)
+            for key, value in waft_stage_seconds.items()
+        },
+        "model_forward_fps": round(
+            (sum(record["model_samples"] for record in waft_timing_records) / waft_model_s)
+            if waft_model_s > 0 else 0.0, 3
+        ),
+        "batch_records": waft_timing_records,
+    }
+    (outdir / "waft_timing.json").write_text(
+        json.dumps(waft_timing, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     stats = {
         "video": str(args.video),
         "scale": args.scale,
@@ -530,6 +585,7 @@ def main() -> None:
         "stage_video_decode_locate_seconds": round(t_decode, 2),
         "stage_stereo_rectify_seconds": round(t_rectify, 2),
         "stage_waft_forward_seconds": round(t_waft, 2),
+        "stage_waft_pipeline_seconds": round(waft_total_s, 2),
         "stage_photometric_align_seconds": round(t_align, 2),
         "stage_center_fusion_seconds": round(t_fusion, 2),
         "stage_disocclusion_fill_seconds": round(t_fill, 2),
@@ -547,6 +603,7 @@ def main() -> None:
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
     print(f"[timing] WAFT 双向前向 {t_waft:.2f}s")
+    print(f"[timing] WAFT 输入到输出管线 {waft_total_s:.2f}s（细分见 waft_timing.json）")
     print(f"[timing] 双目光度对齐 {t_align:.2f}s")
     print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
     print(f"[timing] 遮挡补洞 {t_fill:.2f}s")
@@ -555,6 +612,7 @@ def main() -> None:
     print(f"[timing] 脚本总耗时 {total_s:.2f}s")
     print(f"[timing] 端到端耗时 {e2e_s:.2f}s")
     print(f"[out] {outdir / args.video_name}")
+    print(f"[out] {outdir / 'waft_timing.json'}")
 
 
 if __name__ == "__main__":

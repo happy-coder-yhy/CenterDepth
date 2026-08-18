@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -37,6 +38,28 @@ WAFT_MODEL_CONFIG = {
     "DAv2B-4": "configs/SynLarge/DAv2B-4.yaml",
     "DAv2L-5": "configs/SynLarge/DAv2L-5.yaml",
 }
+
+
+class _TimingRecorder:
+    """WAFT wall-clock stage recorder; CUDA synchronization makes boundaries real."""
+
+    def __init__(self, device: str):
+        self.device = device
+        self.stages: dict[str, float] = {}
+
+    def _sync(self) -> None:
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    @contextmanager
+    def measure(self, name: str):
+        self._sync()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            self.stages[name] = self.stages.get(name, 0.0) + time.perf_counter() - t0
 
 
 def load_waft(
@@ -84,25 +107,31 @@ def _run_once(
     right: torch.Tensor,
     hiera_mode: str,
     use_amp: bool,
+    timing: _TimingRecorder | None = None,
 ) -> tuple[dict, float]:
     """单方向推理：direct 用 model(sample)，hiera 用 0.5->1.0 由粗到细。"""
     sample = {"img1": left, "img2": right}
     if hiera_mode == "hiera":
         def forward():
             return model.heirarchical_inference(
-                sample, size=None, factor_list=[0.5, 1.0]
+                sample, size=None, factor_list=[0.5, 1.0], timing=timing
             )
     else:
-        forward = lambda: model(sample)
+        forward = lambda: model(sample, timing=timing)
 
     if left.device.type == "cuda":
         torch.cuda.synchronize(left.device)
     t0 = time.perf_counter()
-    if use_amp and left.device.type == "cuda":
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = forward()
+    if timing is not None:
+        timing_context = timing.measure("model_forward")
     else:
-        out = forward()
+        timing_context = nullcontext()
+    with timing_context:
+        if use_amp and left.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = forward()
+        else:
+            out = forward()
     if left.device.type == "cuda":
         torch.cuda.synchronize(left.device)
     elapsed = time.perf_counter() - t0
@@ -115,12 +144,18 @@ def _run_bidirectional_once(
     right: torch.Tensor,
     hiera_mode: str,
     use_amp: bool,
+    timing: _TimingRecorder | None = None,
 ) -> tuple[dict, int, float]:
     """把左右两个方向拼为一个 2B 前向，减少一次模型调度和重复开销。"""
     batch = left.shape[0]
-    left_bi = torch.cat((left, torch.flip(right, dims=[3])), dim=0)
-    right_bi = torch.cat((right, torch.flip(left, dims=[3])), dim=0)
-    out, elapsed = _run_once(model, left_bi, right_bi, hiera_mode, use_amp)
+    if timing is not None:
+        pack_context = timing.measure("bidirectional_pack")
+    else:
+        pack_context = nullcontext()
+    with pack_context:
+        left_bi = torch.cat((left, torch.flip(right, dims=[3])), dim=0)
+        right_bi = torch.cat((right, torch.flip(left, dims=[3])), dim=0)
+    out, elapsed = _run_once(model, left_bi, right_bi, hiera_mode, use_amp, timing=timing)
     return out, batch, elapsed
 
 
@@ -248,6 +283,7 @@ def run_stereo_matching(
     hiera: str = "auto",
     conf_mode: str = "info",
     occ_mode: str = "lr",
+    timing_out: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """推理 WAFT-Stereo。
 
@@ -270,31 +306,58 @@ def run_stereo_matching(
     if occ_mode not in ("lr", "visibility"):
         raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
 
-    lt = left.to(device)
-    rt = right.to(device)
+    recorder = _TimingRecorder(device) if timing_out is not None else None
+    t_total = time.perf_counter()
+    if recorder is not None:
+        with recorder.measure("input_transfer"):
+            lt = left.to(device)
+            rt = right.to(device)
+    else:
+        lt = left.to(device)
+        rt = right.to(device)
     need_r = (occ_mode == "lr") or (conf_mode == "lr")
     if need_r:
         # 正值约束模型：右参考必须水平翻转+交换输入，否则 dR 为半尺度垃圾值。
         out_bi, batch, elapsed = _run_bidirectional_once(
-            model, lt, rt, hiera_mode, use_amp
+            model, lt, rt, hiera_mode, use_amp, timing=recorder
         )
-        disp = out_bi["disp_pred"][:batch]
-        dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])
-        info = out_bi["delta_info_preds"][-1][:batch]
+        if recorder is not None:
+            with recorder.measure("output_split_flip"):
+                disp = out_bi["disp_pred"][:batch]
+                dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])
+                info = out_bi["delta_info_preds"][-1][:batch]
+        else:
+            disp = out_bi["disp_pred"][:batch]
+            dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])
+            info = out_bi["delta_info_preds"][-1][:batch]
     else:
-        out_l, elapsed = _run_once(model, lt, rt, hiera_mode, use_amp)
+        out_l, elapsed = _run_once(model, lt, rt, hiera_mode, use_amp, timing=recorder)
         disp = out_l["disp_pred"]
         info = out_l["delta_info_preds"][-1]
-    if occ_mode == "lr":
-        occ = _lr_consistency_mask(disp, dR, H, W)
+    if recorder is not None:
+        post_context = recorder.measure("confidence_occ_postprocess")
     else:
-        occ = _visibility_mask(disp, H, W)
-    if conf_mode == "lr":
-        conf = _lr_confidence(disp, dR, H, W)
-    else:
-        conf = _conf_from_info(info, conf_mode, disp)
+        post_context = nullcontext()
+    with post_context:
+        if occ_mode == "lr":
+            occ = _lr_consistency_mask(disp, dR, H, W)
+        else:
+            occ = _visibility_mask(disp, H, W)
+        if conf_mode == "lr":
+            conf = _lr_confidence(disp, dR, H, W)
+        else:
+            conf = _conf_from_info(info, conf_mode, disp)
 
-    return disp[0].float().cpu(), occ.float().cpu(), conf.float().cpu(), elapsed
+    if recorder is not None:
+        with recorder.measure("output_cpu_transfer"):
+            result = disp[0].float().cpu(), occ.float().cpu(), conf.float().cpu(), elapsed
+        recorder._sync()
+        timing_out.update(recorder.stages)
+        timing_out["waft_total_seconds"] = time.perf_counter() - t_total
+        timing_out["model_forward_seconds"] = recorder.stages.get("model_forward", elapsed)
+    else:
+        result = disp[0].float().cpu(), occ.float().cpu(), conf.float().cpu(), elapsed
+    return result
 
 
 @torch.no_grad()
@@ -307,6 +370,7 @@ def run_stereo_matching_bi(
     hiera: str = "auto",
     conf_mode: str = "info",
     occ_mode: str = "lr",
+    timing_out: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """双向视差推理（左右参考各一次前向）。
 
@@ -327,36 +391,62 @@ def run_stereo_matching_bi(
     if occ_mode not in ("lr", "visibility"):
         raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
 
-    lt = left.to(device)
-    rt = right.to(device)
+    recorder = _TimingRecorder(device) if timing_out is not None else None
+    t_total = time.perf_counter()
+    if recorder is not None:
+        with recorder.measure("input_transfer"):
+            lt = left.to(device)
+            rt = right.to(device)
+    else:
+        lt = left.to(device)
+        rt = right.to(device)
     out_bi, batch, elapsed = _run_bidirectional_once(
-        model, lt, rt, hiera_mode, use_amp
+        model, lt, rt, hiera_mode, use_amp, timing=recorder
     )
-    dL = out_bi["disp_pred"][:batch]
-    dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])  # 翻回原右图坐标
-    if occ_mode == "visibility":
-        occL = _visibility_mask(dL, H, W)
-        occR = _visibility_mask(dR, H, W)
+    if recorder is not None:
+        with recorder.measure("output_split_flip"):
+            dL = out_bi["disp_pred"][:batch]
+            dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])
+            infoL = out_bi["delta_info_preds"][-1][:batch]
+            infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
     else:
-        occL = _lr_consistency_mask(dL, dR, H, W)
-        occR = _lr_consistency_mask(dR, dL, H, W)
-    infoL = out_bi["delta_info_preds"][-1][:batch]
-    infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
-    if conf_mode == "lr":
-        confL = _lr_confidence(dL, dR, H, W)
-        confR = _lr_confidence(dR, dL, H, W)
+        dL = out_bi["disp_pred"][:batch]
+        dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2])  # 翻回原右图坐标
+        infoL = out_bi["delta_info_preds"][-1][:batch]
+        infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
+    if recorder is not None:
+        post_context = recorder.measure("confidence_occ_postprocess")
     else:
-        confL = _conf_from_info(infoL, conf_mode, dL)
-        confR = _conf_from_info(infoR, conf_mode, dR)
-    return (
-        dL[0].float().cpu(),
-        dR[0].float().cpu(),
-        occL.float().cpu(),
-        occR.float().cpu(),
-        confL.float().cpu(),
-        confR.float().cpu(),
-        elapsed,
-    )
+        post_context = nullcontext()
+    with post_context:
+        if occ_mode == "visibility":
+            occL = _visibility_mask(dL, H, W)
+            occR = _visibility_mask(dR, H, W)
+        else:
+            occL = _lr_consistency_mask(dL, dR, H, W)
+            occR = _lr_consistency_mask(dR, dL, H, W)
+        if conf_mode == "lr":
+            confL = _lr_confidence(dL, dR, H, W)
+            confR = _lr_confidence(dR, dL, H, W)
+        else:
+            confL = _conf_from_info(infoL, conf_mode, dL)
+            confR = _conf_from_info(infoR, conf_mode, dR)
+    if recorder is not None:
+        with recorder.measure("output_cpu_transfer"):
+            result = (
+                dL[0].float().cpu(), dR[0].float().cpu(), occL.float().cpu(),
+                occR.float().cpu(), confL.float().cpu(), confR.float().cpu(), elapsed,
+            )
+        recorder._sync()
+        timing_out.update(recorder.stages)
+        timing_out["waft_total_seconds"] = time.perf_counter() - t_total
+        timing_out["model_forward_seconds"] = recorder.stages.get("model_forward", elapsed)
+    else:
+        result = (
+            dL[0].float().cpu(), dR[0].float().cpu(), occL.float().cpu(),
+            occR.float().cpu(), confL.float().cpu(), confR.float().cpu(), elapsed,
+        )
+    return result
 
 
 @torch.no_grad()
@@ -369,6 +459,7 @@ def run_stereo_matching_bi_batch(
     hiera: str = "auto",
     conf_mode: str = "lr",
     occ_mode: str = "lr",
+    timing_out: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """批量双向视差推理（深度视频用）。
 
@@ -386,25 +477,53 @@ def run_stereo_matching_bi_batch(
         raise ValueError(f"未知置信度模式: {conf_mode}（可选 info/ones/lr）")
     if occ_mode not in ("lr", "visibility"):
         raise ValueError(f"未知遮挡模式: {occ_mode}（可选 lr/visibility）")
-    lt = left.to(device)
-    rt = right.to(device)
+    recorder = _TimingRecorder(device) if timing_out is not None else None
+    t_total = time.perf_counter()
+    if recorder is not None:
+        with recorder.measure("input_transfer"):
+            lt = left.to(device)
+            rt = right.to(device)
+    else:
+        lt = left.to(device)
+        rt = right.to(device)
     out_bi, batch, elapsed = _run_bidirectional_once(
-        model, lt, rt, hiera_mode, use_amp
+        model, lt, rt, hiera_mode, use_amp, timing=recorder
     )
-    dL = out_bi["disp_pred"][:batch].float()
-    dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2]).float()
-    infoL = out_bi["delta_info_preds"][-1][:batch]
-    infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
-    if occ_mode == "visibility":
-        occL = _visibility_mask_batch(dL, H, W)
-        occR = _visibility_mask_batch(dR, H, W)
+    if recorder is not None:
+        with recorder.measure("output_split_flip"):
+            dL = out_bi["disp_pred"][:batch].float()
+            dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2]).float()
+            infoL = out_bi["delta_info_preds"][-1][:batch]
+            infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
     else:
-        occL = _lr_consistency_mask_batch(dL, dR, H, W)
-        occR = _lr_consistency_mask_batch(dR, dL, H, W)
-    if conf_mode == "lr":
-        confL = _lr_confidence_batch(dL, dR, H, W)
-        confR = _lr_confidence_batch(dR, dL, H, W)
+        dL = out_bi["disp_pred"][:batch].float()
+        dR = torch.flip(out_bi["disp_pred"][batch:], dims=[2]).float()
+        infoL = out_bi["delta_info_preds"][-1][:batch]
+        infoR = torch.flip(out_bi["delta_info_preds"][-1][batch:], dims=[3])
+    if recorder is not None:
+        post_context = recorder.measure("confidence_occ_postprocess")
     else:
-        confL = _conf_from_info_batch(infoL, conf_mode, dL)
-        confR = _conf_from_info_batch(infoR, conf_mode, dR)
-    return dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), elapsed
+        post_context = nullcontext()
+    with post_context:
+        if occ_mode == "visibility":
+            occL = _visibility_mask_batch(dL, H, W)
+            occR = _visibility_mask_batch(dR, H, W)
+        else:
+            occL = _lr_consistency_mask_batch(dL, dR, H, W)
+            occR = _lr_consistency_mask_batch(dR, dL, H, W)
+        if conf_mode == "lr":
+            confL = _lr_confidence_batch(dL, dR, H, W)
+            confR = _lr_confidence_batch(dR, dL, H, W)
+        else:
+            confL = _conf_from_info_batch(infoL, conf_mode, dL)
+            confR = _conf_from_info_batch(infoR, conf_mode, dR)
+    if recorder is not None:
+        with recorder.measure("output_cpu_transfer"):
+            result = dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), elapsed
+        recorder._sync()
+        timing_out.update(recorder.stages)
+        timing_out["waft_total_seconds"] = time.perf_counter() - t_total
+        timing_out["model_forward_seconds"] = recorder.stages.get("model_forward", elapsed)
+    else:
+        result = dL.cpu(), dR.cpu(), occL.cpu(), occR.cpu(), confL.cpu(), confR.cpu(), elapsed
+    return result

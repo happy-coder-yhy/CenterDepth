@@ -2,6 +2,7 @@ import torch
 import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 from copy import deepcopy
 from timm.layers import Mlp
@@ -10,6 +11,10 @@ from einops import rearrange
 from model.iterative import fetch_iterative_module
 from model.encoder import fetch_feature_encoder
 from model.utils import Padder, disp_warp, gaussian_weights
+
+
+def _timed(timing, name):
+    return timing.measure(name) if timing is not None else nullcontext()
 
 def freeze_module(module):
     for p in module.parameters():
@@ -55,62 +60,69 @@ class WAFT(nn.Module):
         up_info = up_info.permute(0, 1, 4, 2, 5, 3)
         return up_info.reshape(N, C, 2*H, 2*W)
     
-    def forward(self, sample, disp_init=None):
+    def forward(self, sample, disp_init=None, timing=None):
         """ Estimate disparity between pair of frames """
         output = {}
-        image1 = self.normalize_image(sample['img1'])
-        image2 = self.normalize_image(sample['img2'])
-        padder = Padder(image1.shape, factor=self.factor)
-        image1 = padder.pad(image1)
-        image2 = padder.pad(image2)
+        with _timed(timing, "normalize"):
+            image1 = self.normalize_image(sample['img1'])
+            image2 = self.normalize_image(sample['img2'])
+        with _timed(timing, "pad_input"):
+            padder = Padder(image1.shape, factor=self.factor)
+            image1 = padder.pad(image1)
+            image2 = padder.pad(image2)
 
-        fmap1, fmap2, net = self.encoder(torch.stack([image1, image2], dim=1))
+        with _timed(timing, "feature_encoder"):
+            fmap1, fmap2, net = self.encoder(torch.stack([image1, image2], dim=1))
         n, _, h, w = fmap1.shape
 
-        idx_bins_2x = torch.linspace(0, self.max_disp/2, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
-        idx_bins_1x = torch.linspace(0, self.max_disp/1, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
+        with _timed(timing, "initial_disparity"):
+            idx_bins_2x = torch.linspace(0, self.max_disp/2, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
+            idx_bins_1x = torch.linspace(0, self.max_disp/1, self.n_bins, device=fmap1.device, dtype=fmap1.dtype).view(1, self.n_bins, 1, 1)
 
-        prop_hidden = self.prop_proj(torch.cat([fmap1, fmap2], dim=1))
-        prop_hidden = self.prop_decoder(prop_hidden)
-        prob_mask = .25 * self.prop_mask_head(prop_hidden)
-        prob_bins = self.prop_bins_head(prop_hidden)
-        prob_up = self.convex_upsample(prob_bins, prob_mask)
-        output['init'] = padder.unpad(prob_up)
-        prob_bins = F.softmax(prob_bins, dim=1)
-        disp = torch.sum(prob_bins * idx_bins_2x, dim=1, keepdim=True)
+            prop_hidden = self.prop_proj(torch.cat([fmap1, fmap2], dim=1))
+            prop_hidden = self.prop_decoder(prop_hidden)
+            prob_mask = .25 * self.prop_mask_head(prop_hidden)
+            prob_bins = self.prop_bins_head(prop_hidden)
+            prob_up = self.convex_upsample(prob_bins, prob_mask)
+            output['init'] = padder.unpad(prob_up)
+            prob_bins = F.softmax(prob_bins, dim=1)
+            disp = torch.sum(prob_bins * idx_bins_2x, dim=1, keepdim=True)
 
-        if disp_init is not None:
-            disp = padder.pad(disp_init.unsqueeze(1))
-            disp = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
+            if disp_init is not None:
+                disp = padder.pad(disp_init.unsqueeze(1))
+                disp = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
 
         delta_disp_preds = []
         delta_info_preds = []
         for itr in range(self.iters):
-            disp = disp.detach()
-            warped_fmap2 = disp_warp(fmap2, disp, padding_mode='zeros')
-            net = self.delta_proj(torch.cat([fmap1, warped_fmap2, net, disp], dim=1))
-            net = self.delta_decoder(net)
-            info = self.delta_dist_head(net)
-            delta_disp = self.delta_disp_head(net)
-            mask = .25 * self.delta_mask_head(net)
-            disp = disp + delta_disp
-            disp_up = self.convex_upsample(disp * 2, mask)
-            info_up = self.convex_upsample(info, mask)
-            delta_disp_preds.append(disp_up)
-            delta_info_preds.append(info_up)
+            with _timed(timing, f"iteration_{itr + 1}"):
+                disp = disp.detach()
+                warped_fmap2 = disp_warp(fmap2, disp, padding_mode='zeros')
+                net = self.delta_proj(torch.cat([fmap1, warped_fmap2, net, disp], dim=1))
+                net = self.delta_decoder(net)
+                info = self.delta_dist_head(net)
+                delta_disp = self.delta_disp_head(net)
+                mask = .25 * self.delta_mask_head(net)
+                disp = disp + delta_disp
+                disp_up = self.convex_upsample(disp * 2, mask)
+                info_up = self.convex_upsample(info, mask)
+                delta_disp_preds.append(disp_up)
+                delta_info_preds.append(info_up)
 
-        output['delta_disp_preds'] = [padder.unpad(disp) for disp in delta_disp_preds]
-        output['delta_info_preds'] = [padder.unpad(info) for info in delta_info_preds]
-        if self.iters > 0:
-            disp_final = output['delta_disp_preds'][-1].squeeze(1)
-            output['disp_pred'] = disp_final
-        else:
-            disp_final = torch.sum(F.softmax(output['init'], dim=1) * idx_bins_1x, dim=1)
-            output['disp_pred'] = disp_final
+        with _timed(timing, "unpad_outputs"):
+            output['delta_disp_preds'] = [padder.unpad(disp) for disp in delta_disp_preds]
+            output['delta_info_preds'] = [padder.unpad(info) for info in delta_info_preds]
+        with _timed(timing, "finalize_disparity"):
+            if self.iters > 0:
+                disp_final = output['delta_disp_preds'][-1].squeeze(1)
+                output['disp_pred'] = disp_final
+            else:
+                disp_final = torch.sum(F.softmax(output['init'], dim=1) * idx_bins_1x, dim=1)
+                output['disp_pred'] = disp_final
         
         return output
 
-    def inference(self, sample, size=None, factor=1.0, disp_init=None): 
+    def inference(self, sample, size=None, factor=1.0, disp_init=None, timing=None):
         sample = {
             'img1': F.interpolate(sample['img1'], scale_factor=factor, mode='bilinear', align_corners=True),
             'img2': F.interpolate(sample['img2'], scale_factor=factor, mode='bilinear', align_corners=True)
@@ -118,7 +130,8 @@ class WAFT(nn.Module):
         disp_init = None if disp_init is None else F.interpolate(disp_init.unsqueeze(1), scale_factor=factor, mode='bilinear', align_corners=True).squeeze(1) * factor
 
         if size is None:
-            output = self.forward(sample, disp_init=disp_init)
+            with _timed(timing, "inference_forward"):
+                output = self.forward(sample, disp_init=disp_init, timing=timing)
             for k in output.keys():
                 if 'disp' in k:
                     ratio = 1/factor
@@ -156,7 +169,7 @@ class WAFT(nn.Module):
                 sample_patch['img1'] = img1[:, :, lh:rh, lw:rw]
                 sample_patch['img2'] = img2[:, :, lh:rh, lw:rw]
                 disp_init_patch = None if disp_init is None else disp_init[:, lh:rh, lw:rw]
-                output_patch = self.forward(sample_patch, disp_init=disp_init_patch)
+                output_patch = self.forward(sample_patch, disp_init=disp_init_patch, timing=timing)
                 for k in output_patch.keys():
                     if k not in output:
                         if isinstance(output_patch[k], list):
@@ -197,11 +210,12 @@ class WAFT(nn.Module):
         
         return output
     
-    def heirarchical_inference(self, sample, size=None, factor_list=None):
+    def heirarchical_inference(self, sample, size=None, factor_list=None, timing=None):
         output = {}
         disp_init = None
         for i in range(len(factor_list)):
-            output = self.inference(sample, size=size, factor=factor_list[i], disp_init=disp_init)
+            with _timed(timing, f"hierarchical_scale_{factor_list[i]}"):
+                output = self.inference(sample, size=size, factor=factor_list[i], disp_init=disp_init, timing=timing)
             disp_init = output['disp_pred']
 
         return output
