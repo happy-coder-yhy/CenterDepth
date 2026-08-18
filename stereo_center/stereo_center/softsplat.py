@@ -66,12 +66,26 @@ def softmax_splatting(
 
     feat_w = (feature * wgt).reshape(B, C, -1)
     wgt_flat = wgt.reshape(B, 1, -1)
-    out = torch.zeros(B, C, H * W, dtype=feature.dtype, device=feature.device)
-    norm = torch.zeros(B, 1, H * W, dtype=feature.dtype, device=feature.device)
-    for b in range(B):
-        idx_b = idx[b][v[b]]
-        out[b].index_add_(1, idx_b, feat_w[b][:, v[b]])
-        norm[b].index_add_(1, idx_b, wgt_flat[b][:, v[b]])
+    # 把 batch 维编码进目标像素索引，一次 scatter_add 替代逐样本
+    # index_add；投影规则和累加顺序保持不变，减少大量 GPU kernel 调度。
+    batch_offset = torch.arange(B, device=feature.device).view(B, 1) * (H * W)
+    idx_global = (idx + batch_offset).reshape(-1)
+    valid_flat = v.reshape(-1)
+    idx_valid = idx_global[valid_flat]
+    out_flat = torch.zeros(C, B * H * W, dtype=feature.dtype, device=feature.device)
+    out_flat.scatter_add_(
+        1,
+        idx_valid.unsqueeze(0).expand(C, -1),
+        feat_w.permute(1, 0, 2).reshape(C, -1)[:, valid_flat],
+    )
+    norm_flat = torch.zeros(1, B * H * W, dtype=feature.dtype, device=feature.device)
+    norm_flat.scatter_add_(
+        1,
+        idx_valid.unsqueeze(0),
+        wgt_flat.permute(1, 0, 2).reshape(1, -1)[:, valid_flat],
+    )
+    out = out_flat.view(C, B, H * W).permute(1, 0, 2)
+    norm = norm_flat.view(B, 1, H * W)
 
     out = out.reshape(B, C, H, W)
     norm = norm.reshape(B, 1, H, W)
@@ -109,13 +123,19 @@ def hard_min_splatting(
     inb = (tx >= 0) & (tx < W) & (ty >= 0) & (ty < H) & keep[:, 0]
     idx = (ty * W + tx).reshape(B, -1)
     v = inb.reshape(B, -1)
+    batch_offset = torch.arange(B, device=feature.device).view(B, 1) * (H * W)
+    idx_global = (idx + batch_offset).reshape(-1)
+    valid_flat = v.reshape(-1)
     out = torch.full(
-        (B, H * W), float("inf"), dtype=feature.dtype, device=feature.device
+        (B * H * W,), float("inf"), dtype=feature.dtype, device=feature.device
     )
-    for b in range(B):
-        sel = idx[b][v[b]]
-        f = feature[b, 0].reshape(-1)[v[b]]
-        out[b].index_reduce_(0, sel, f, reduce="amin", include_self=False)
+    out.scatter_reduce_(
+        0,
+        idx_global[valid_flat],
+        feature[:, 0].reshape(-1)[valid_flat],
+        reduce="amin",
+        include_self=False,
+    )
     out = out.reshape(B, 1, H, W)
     return torch.where(torch.isfinite(out), out, torch.zeros_like(out))
 
