@@ -1,4 +1,4 @@
-"""立体匹配后端统一入口（s2m2 | waft）。
+"""立体匹配后端统一入口（s2m2 | waft | las2 | ffs）。
 
 waft 相关模块按需惰性导入，避免 s2m2 路径依赖 peft/timm/yacs
 （服务器 allbase_env 可继续独立运行 s2m2）。
@@ -6,7 +6,7 @@ waft 相关模块按需惰性导入，避免 s2m2 路径依赖 peft/timm/yacs
 
 from __future__ import annotations
 
-BACKENDS = ("s2m2", "waft", "las2")
+BACKENDS = ("s2m2", "waft", "las2", "ffs")
 
 
 def get_backend(name: str):
@@ -23,6 +23,10 @@ def get_backend(name: str):
         from . import las2_inference
 
         return las2_inference
+    if name == "ffs":
+        from . import ffs_inference
+
+        return ffs_inference
     raise ValueError(f"未知立体匹配后端: {name}（可选: {', '.join(BACKENDS)}）")
 
 
@@ -48,6 +52,15 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             max_disp=kwargs.get("max_disp", 192),
             las_root=kwargs.get("las_root"),
         )
+    if backend == "ffs":
+        from . import ffs_inference
+
+        return ffs_inference.load_ffs(
+            model_type, weights_dir, device,
+            max_disp=kwargs.get("max_disp", 416),
+            valid_iters=kwargs.get("valid_iters", 8),
+            ffs_root=kwargs.get("ffs_root"),
+        )
     raise ValueError(f"未知立体匹配后端: {backend}")
 
 
@@ -67,6 +80,10 @@ def run(backend: str, model, left, right, device: str, **kwargs):
         from . import las2_inference
 
         return las2_inference.run_stereo_matching(model, left, right, device, **kwargs)
+    if backend == "ffs":
+        from . import ffs_inference
+
+        return ffs_inference.run_stereo_matching(model, left, right, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")
 
 
@@ -86,6 +103,10 @@ def run_bi(backend: str, model, left, right, device: str, **kwargs):
         from . import las2_inference
 
         return las2_inference.run_stereo_matching_bi(model, left, right, device, **kwargs)
+    if backend == "ffs":
+        from . import ffs_inference
+
+        return ffs_inference.run_stereo_matching_bi(model, left, right, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")
 
 
@@ -99,4 +120,8 @@ def run_bi_batch(backend: str, model, left, right, device: str, **kwargs):
         from . import las2_inference
 
         return las2_inference.run_stereo_matching_bi_batch(model, left, right, device, **kwargs)
+    if backend == "ffs":
+        from . import ffs_inference
+
+        return ffs_inference.run_stereo_matching_bi_batch(model, left, right, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")

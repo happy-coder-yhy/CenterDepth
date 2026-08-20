@@ -1,5 +1,7 @@
-"""S²M² + SoftSplat 最小可运行工程（双目 -> 中心视角 RGB + Depth）。"""
+"""Stereo center-depth pipeline package.
 
-from . import calib, s2m2_inference, softsplat
+Submodules are imported lazily by callers so optional stereo backends do not
+force unrelated third-party dependencies at package import time.
+"""
 
 __all__ = ["calib", "s2m2_inference", "softsplat"]

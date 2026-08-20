@@ -228,10 +228,12 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
+    parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
+    parser.add_argument("--ffs-valid-iters", type=int, default=8, help="FFS recurrent refinement iterations")
     parser.add_argument("--waft-iters", type=int, default=None, help="WAFT 迭代轮数（默认取配置 4；2/3 可提速）")
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -321,6 +323,7 @@ def main() -> None:
     model = stereo_backend.load(
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
+        ffs_root=args.ffs_root, valid_iters=args.ffs_valid_iters,
         iters=args.waft_iters,
     )
     t_model_load += time.perf_counter() - t0
