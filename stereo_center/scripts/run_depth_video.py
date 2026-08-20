@@ -46,12 +46,24 @@ from stereo_center.visualize import (  # noqa: E402
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
     if explicit:
         return Path(explicit)
-    env_map = {"waft": "WAFT_WEIGHTS_DIR", "s2m2": "S2M2_WEIGHTS_DIR", "las2": "LAS2_WEIGHTS_DIR"}
+    env_map = {
+        "waft": "WAFT_WEIGHTS_DIR",
+        "s2m2": "S2M2_WEIGHTS_DIR",
+        "las2": "LAS2_WEIGHTS_DIR",
+        "ffs": "FFS_WEIGHTS_DIR",
+    }
     env = env_map[backend]
     if env in os.environ:
         return Path(os.environ[env])
     repo_root = PROJECT_ROOT.parent
-    subs = ["las2", "pretrain_weights"] if backend == "las2" else (["waft"] if backend == "waft" else ["pretrain_weights"])
+    if backend == "las2":
+        subs = ["las2", "pretrain_weights"]
+    elif backend == "waft":
+        subs = ["waft"]
+    elif backend == "ffs":
+        subs = ["fast_foundation_stereo", "pretrain_weights"]
+    else:
+        subs = ["pretrain_weights"]
     for sub in subs:
         for c in (repo_root / "weights" / sub, PROJECT_ROOT / "weights" / sub):
             if c.exists():
@@ -63,6 +75,11 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
             if backend != "las2" or any(c.rglob(fname)):
                 return c
     raise FileNotFoundError(f"未找到权重目录（{backend}），请用 --weights 或环境变量 {env}")
+
+
+def timing_artifact_name(backend: str) -> str:
+    """Return backend-specific timing artifact filename."""
+    return f"{backend}_timing.json"
 
 
 def warp_with_flow(src: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -395,19 +412,25 @@ def main() -> None:
         t_fusion += timing["center_fusion"]
         t_fill += timing["fill"]
         t_depth_gf += timing["depth_gf"]
-        if timing.get("waft_detail") is not None:
-            waft_timing_records.append({
-                "batch_index": len(waft_timing_records),
-                "start_frame": frame_idx,
-                "end_frame": frame_idx + B,
-                "batch_size": B,
-                "model_samples": 2 * B if args.bi else B,
-                "stages_seconds": {
+        timing_detail = timing.get("waft_detail")
+        if timing_detail is not None:
+            stages_seconds = {
                     key: round(float(value), 6)
-                    for key, value in timing["waft_detail"].items()
+                    for key, value in timing_detail.items()
                     if isinstance(value, (int, float))
-                },
-            })
+                }
+        else:
+            stages_seconds = {
+                "stereo_forward_seconds": round(float(timing["waft_forward"]), 6)
+            }
+        waft_timing_records.append({
+            "batch_index": len(waft_timing_records),
+            "start_frame": frame_idx,
+            "end_frame": frame_idx + B,
+            "batch_size": B,
+            "model_samples": 2 * B if args.bi else B,
+            "stages_seconds": stages_seconds,
+        })
 
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
@@ -521,9 +544,16 @@ def main() -> None:
     for record in waft_timing_records:
         for key, value in record["stages_seconds"].items():
             waft_stage_seconds[key] = waft_stage_seconds.get(key, 0.0) + value
-    waft_total_s = waft_stage_seconds.get("waft_total_seconds", 0.0)
-    waft_model_s = waft_stage_seconds.get("model_forward_seconds", 0.0)
-    waft_timing = {
+    stereo_total_s = waft_stage_seconds.get(
+        "waft_total_seconds",
+        waft_stage_seconds.get("stereo_forward_seconds", 0.0),
+    )
+    stereo_model_s = waft_stage_seconds.get(
+        "model_forward_seconds",
+        waft_stage_seconds.get("stereo_forward_seconds", 0.0),
+    )
+    timing_filename = timing_artifact_name(backend)
+    stereo_timing = {
         "video": str(args.video),
         "backend": backend,
         "model_type": args.model_type,
@@ -542,13 +572,13 @@ def main() -> None:
             for key, value in waft_stage_seconds.items()
         },
         "model_forward_fps": round(
-            (sum(record["model_samples"] for record in waft_timing_records) / waft_model_s)
-            if waft_model_s > 0 else 0.0, 3
+            (sum(record["model_samples"] for record in waft_timing_records) / stereo_model_s)
+            if stereo_model_s > 0 else 0.0, 3
         ),
         "batch_records": waft_timing_records,
     }
-    (outdir / "waft_timing.json").write_text(
-        json.dumps(waft_timing, ensure_ascii=False, indent=2), encoding="utf-8"
+    (outdir / timing_filename).write_text(
+        json.dumps(stereo_timing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     stats = {
         "video": str(args.video),
@@ -588,7 +618,10 @@ def main() -> None:
         "stage_video_decode_locate_seconds": round(t_decode, 2),
         "stage_stereo_rectify_seconds": round(t_rectify, 2),
         "stage_waft_forward_seconds": round(t_waft, 2),
-        "stage_waft_pipeline_seconds": round(waft_total_s, 2),
+        "stage_waft_pipeline_seconds": round(stereo_total_s, 2),
+        "stage_stereo_forward_seconds": round(t_waft, 2),
+        "stage_stereo_pipeline_seconds": round(stereo_total_s, 2),
+        "stereo_timing_file": timing_filename,
         "stage_photometric_align_seconds": round(t_align, 2),
         "stage_center_fusion_seconds": round(t_fusion, 2),
         "stage_disocclusion_fill_seconds": round(t_fill, 2),
@@ -605,8 +638,9 @@ def main() -> None:
     print(f"[timing] 模型加载 {t_model_load:.2f}s")
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
-    print(f"[timing] WAFT 双向前向 {t_waft:.2f}s")
-    print(f"[timing] WAFT 输入到输出管线 {waft_total_s:.2f}s（细分见 waft_timing.json）")
+    backend_label = backend.upper()
+    print(f"[timing] {backend_label} 双向前向 {t_waft:.2f}s")
+    print(f"[timing] {backend_label} 输入到输出管线 {stereo_total_s:.2f}s（细分见 {timing_filename}）")
     print(f"[timing] 双目光度对齐 {t_align:.2f}s")
     print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
     print(f"[timing] 遮挡补洞 {t_fill:.2f}s")
@@ -615,7 +649,7 @@ def main() -> None:
     print(f"[timing] 脚本总耗时 {total_s:.2f}s")
     print(f"[timing] 端到端耗时 {e2e_s:.2f}s")
     print(f"[out] {outdir / args.video_name}")
-    print(f"[out] {outdir / 'waft_timing.json'}")
+    print(f"[out] {outdir / timing_filename}")
 
 
 if __name__ == "__main__":
