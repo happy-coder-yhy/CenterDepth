@@ -51,6 +51,7 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
         "s2m2": "S2M2_WEIGHTS_DIR",
         "las2": "LAS2_WEIGHTS_DIR",
         "ffs": "FFS_WEIGHTS_DIR",
+        "foundation": "FOUNDATION_WEIGHTS_DIR",
     }
     env = env_map[backend]
     if env in os.environ:
@@ -62,6 +63,8 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
         subs = ["waft"]
     elif backend == "ffs":
         subs = ["fast_foundation_stereo", "pretrain_weights"]
+    elif backend == "foundation":
+        subs = ["foundation_stereo", "FoundationStereo/pretrained_models/23-51-11"]
     else:
         subs = ["pretrain_weights"]
     for sub in subs:
@@ -82,6 +85,89 @@ def timing_artifact_name(backend: str) -> str:
     return f"{backend}_timing.json"
 
 
+def validate_waft_temporal_mode(args, hiera_mode: str) -> None:
+    """Reject combinations that cannot preserve WAFT temporal semantics."""
+    if not args.waft_temporal_init:
+        return
+    if args.stereo_backend != "waft":
+        raise ValueError("--waft-temporal-init is available only for the WAFT backend")
+    if not args.bi:
+        raise ValueError("--waft-temporal-init requires --bi 1")
+    if hiera_mode != "direct":
+        raise ValueError("--waft-temporal-init supports direct WAFT inference only")
+    if args.temporal_raft:
+        raise ValueError(
+            "--waft-temporal-init cannot be combined with final-depth --temporal-raft smoothing"
+        )
+
+
+def add_waft_temporal_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add WAFT warm-start controls without changing the default pipeline."""
+    parser.add_argument(
+        "--waft-temporal-init", type=int, default=0, choices=[0, 1],
+        help="用相邻帧视差作为 WAFT 粗视差初始化（不平滑最终深度）",
+    )
+    parser.add_argument(
+        "--waft-temporal-flow-iters", type=int, default=12,
+        help="WAFT 时序初始化的 RAFT 光流迭代次数",
+    )
+    parser.add_argument(
+        "--waft-temporal-blend", type=float, default=0.75,
+        help="有效时序先验在 WAFT 粗初始化中的权重",
+    )
+    parser.add_argument(
+        "--waft-temporal-photo-tol", type=float, default=40.0,
+        help="时序先验光度一致性容差（RGB 0-255）",
+    )
+    parser.add_argument(
+        "--waft-temporal-flow-abs-tol", type=float, default=0.5,
+        help="前后向光流一致性绝对容差（像素）",
+    )
+    parser.add_argument(
+        "--waft-temporal-flow-rel-tol", type=float, default=0.01,
+        help="前后向光流一致性相对容差",
+    )
+    parser.add_argument(
+        "--waft-temporal-disp-abs-tol", type=float, default=3.0,
+        help="历史先验与当前粗视差的一致性绝对容差（像素）",
+    )
+    parser.add_argument(
+        "--waft-temporal-disp-rel-tol", type=float, default=0.15,
+        help="历史先验与当前粗视差的一致性相对容差",
+    )
+
+
+def waft_temporal_kwargs(args, temporal_flow_model, temporal_state) -> dict:
+    """Build optional WAFT arguments so the non-temporal path stays unchanged."""
+    if not args.waft_temporal_init:
+        return {}
+    return {
+        "temporal_flow_model": temporal_flow_model,
+        "temporal_state": temporal_state,
+        "temporal_flow_iters": args.waft_temporal_flow_iters,
+        "temporal_blend": args.waft_temporal_blend,
+        "temporal_photo_tol": args.waft_temporal_photo_tol,
+        "temporal_flow_abs_tol": args.waft_temporal_flow_abs_tol,
+        "temporal_flow_rel_tol": args.waft_temporal_flow_rel_tol,
+        "temporal_disp_abs_tol": args.waft_temporal_disp_abs_tol,
+        "temporal_disp_rel_tol": args.waft_temporal_disp_rel_tol,
+    }
+
+
+def weighted_temporal_valid_ratio(records: list[dict]) -> float | None:
+    """Average valid-prior coverage by frame count, including short final batches."""
+    weighted = 0.0
+    frames = 0
+    for record in records:
+        ratio = record.get("temporal_valid_ratio")
+        if ratio is None:
+            continue
+        batch_size = int(record["batch_size"])
+        weighted += float(ratio) * batch_size
+        frames += batch_size
+    return weighted / frames if frames else None
+
+
 def warp_with_flow(src: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     """src: (1,1,H,W)；flow: (1,2,H,W) 像素位移 -> 采样结果 (1,1,H,W)。"""
     B, C, H, W = src.shape
@@ -98,6 +184,36 @@ def warp_with_flow(src: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     )
 
 
+def left_view_depth_from_disparity(
+    disp: torch.Tensor,
+    occ: torch.Tensor,
+    fx: float,
+    baseline: float,
+    device: str,
+    valid_mode: str = "strict",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert left-reference disparity to metric left-camera depth.
+
+    disp/occ are (B,H,W) CPU or GPU tensors.  Output depth/valid are
+    (B,1,H,W) on ``device``.  Invalid pixels remain in depth for color scaling,
+    but ``valid`` marks them out for visualization.
+    """
+    disp_d = disp.to(device).float()
+    occ_d = occ.to(device).float()
+    if valid_mode == "strict":
+        valid = torch.isfinite(disp_d) & (disp_d > 1e-6) & (occ_d > 0.5)
+    elif valid_mode == "paper":
+        # Paper/demo-style visualization: show the predicted disparity map itself.
+        # Do not black out pixels only because the one-way visibility check says
+        # their correspondence falls outside the image.  This is a visualization
+        # choice, not a change to WAFT inference.
+        valid = torch.isfinite(disp_d) & (disp_d > 1e-6)
+    else:
+        raise ValueError(f"unknown left-view valid mode: {valid_mode}")
+    depth = float(fx) * float(baseline) / disp_d.clamp_min(1e-6)
+    return depth.unsqueeze(1), valid.unsqueeze(1)
+
+
 def process_batch(
     model,
     bgr_pairs: list,
@@ -105,13 +221,15 @@ def process_batch(
     fx: float,
     baseline: float,
     args,
+    temporal_flow_model=None,
+    temporal_state: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     """校正后 BGR 对列表 → GPU 批量推理 + 融合 + 遮挡填充。
 
     Returns:
-        dep_b: (B, 1, H, W) float32 GPU 中心深度（米，已填充）；
+        dep_b: (B, 1, H, W) float32 GPU 深度（米）；
         valid_b: (B, 1, H, W) bool GPU 有效掩码；
-        rgb_b: (B, 3, H, W) float32 GPU 中心 RGB（0-255）。
+        rgb_b: (B, 3, H, W) float32 GPU RGB（0-255）。
     """
     timing = {
         "waft_forward": 0.0,
@@ -140,13 +258,14 @@ def process_batch(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode=args.conf, occ_mode=args.occ,
                 timing_out=waft_detail,
+                **waft_temporal_kwargs(args, temporal_flow_model, temporal_state),
             )
             timing["waft_forward"] += waft_detail.get("model_forward_seconds", 0.0)
             timing["waft_total"] += waft_detail.get("waft_total_seconds", 0.0)
             timing["waft_detail"] = waft_detail
         else:
             waft_detail = {}
-            dL, occL, confL, _ = waft_inference.run_stereo_matching(
+            dL, occL, confL, _ = waft_inference.run_stereo_matching_batch(
                 model, left_t, right_t, args.device,
                 hiera=args.hiera, conf_mode="ones", occ_mode="visibility",
                 timing_out=waft_detail,
@@ -161,6 +280,7 @@ def process_batch(
             dL, dR, occL, occR, confL, confR, _ = stereo_backend.run_bi_batch(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
+                hiera=args.hiera,
             )
             timing["waft_forward"] += time.perf_counter() - t0
         else:
@@ -168,6 +288,7 @@ def process_batch(
             dL, occL, confL, _ = stereo_backend.run(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
+                hiera=args.hiera,
             )
             timing["waft_forward"] += time.perf_counter() - t0
             dR = occR = confR = None
@@ -181,6 +302,13 @@ def process_batch(
         dL = torch.from_numpy(dL)
         dR = torch.from_numpy(dR) if dR is not None else None
     dev = args.device
+    if args.output_view == "left":
+        dep_b, valid_b = left_view_depth_from_disparity(
+            dL, occL, fx, baseline, dev, valid_mode=args.left_vis_mode
+        )
+        rgb_b = left_t.to(dev)
+        return dep_b, valid_b, rgb_b, timing
+
     # 保持逐帧光度校正，但将中心视角融合本身一次性按 B 帧执行，
     # 避免每帧重复创建投影网格、权重和 z-buffer 中间张量。
     t0 = time.perf_counter()
@@ -245,12 +373,14 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "foundation"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
     parser.add_argument("--ffs-valid-iters", type=int, default=8, help="FFS recurrent refinement iterations")
+    parser.add_argument("--foundation-root", type=str, default=None, help="FoundationStereo 仓库根目录（原版 FoundationStereo）")
+    parser.add_argument("--foundation-valid-iters", type=int, default=32, help="FoundationStereo recurrent refinement iterations")
     parser.add_argument("--waft-iters", type=int, default=None, help="WAFT 迭代轮数（默认取配置 4；2/3 可提速）")
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -272,8 +402,12 @@ def main() -> None:
     parser.add_argument("--temporal-photo-tol", type=float, default=25.0, help="光度一致性门控容差（灰度差）")
     parser.add_argument("--temporal-depth-tol", type=float, default=0.3, help="深度一致性门控绝对容差（米）")
     parser.add_argument("--temporal-depth-rel", type=float, default=0.15, help="深度一致性门控相对容差")
-    parser.add_argument("--raft-weights", type=str, default=None, help="raft-things.pth 路径（--temporal-raft 时必填）")
+    parser.add_argument(
+        "--raft-weights", type=str, default=None,
+        help="raft-things.pth 路径（RAFT 深度平滑或 WAFT 时序初始化）",
+    )
     parser.add_argument("--raft-root", type=str, default=None, help="RAFT 仓库代码根目录")
+    add_waft_temporal_arguments(parser)
     parser.add_argument("--depth-z", type=int, default=1, choices=[0, 1], help="深度 hard z-buffer")
     parser.add_argument(
         "--dmin-m", type=float, default=0.3,
@@ -303,6 +437,20 @@ def main() -> None:
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--save-depth-npy", type=int, default=0, help="每帧额外保存米制深度 npy（供后处理时间平滑）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
+    parser.add_argument(
+        "--output-view",
+        type=str,
+        default="center",
+        choices=["center", "left"],
+        help="输出视角：center=中心视角合成；left=左相机视角深度（不做中心合成）",
+    )
+    parser.add_argument(
+        "--left-vis-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "paper"],
+        help="左视角可视化有效掩码：strict=显示严格有效区域；paper=论文/demo式展示预测图，减少黑点",
+    )
     args = parser.parse_args()
     t_program = time.perf_counter()
 
@@ -311,6 +459,7 @@ def main() -> None:
     backend = args.stereo_backend
 
     t_model_load = 0.0
+    t_temporal_flow_model_load = 0.0
     t_decode = 0.0
     t_rectify = 0.0
     t_waft = 0.0
@@ -333,6 +482,10 @@ def main() -> None:
     baseline = rect["baseline"]
     H, W = out_size[1], out_size[0]
     print(f"[rect] {W}x{H}, fx={fx:.1f}, baseline={baseline:.4f} m")
+    hiera_mode = args.hiera
+    if hiera_mode == "auto":
+        hiera_mode = "hiera" if max(H, W) > 1080 else "direct"
+    validate_waft_temporal_mode(args, hiera_mode)
 
     weights_dir = resolve_weights_dir(args.weights, backend)
     print(f"[weights] {weights_dir}")
@@ -340,18 +493,24 @@ def main() -> None:
     model = stereo_backend.load(
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
-        ffs_root=args.ffs_root, valid_iters=args.ffs_valid_iters,
+        ffs_root=args.ffs_root,
+        foundation_root=args.foundation_root,
+        valid_iters=args.foundation_valid_iters if backend == "foundation" else args.ffs_valid_iters,
+        hiera=args.hiera,
         iters=args.waft_iters,
     )
     t_model_load += time.perf_counter() - t0
     raft = None
-    if args.temporal_raft:
+    if args.temporal_raft or args.waft_temporal_init:
         raft_weights = (
             Path(args.raft_weights).expanduser().resolve()
             if args.raft_weights
             else Path.home() / "BothEyesDepth/stereoanyvideo/third_party/RAFT/models/raft-things.pth"
         )
+        t0 = time.perf_counter()
         raft = load_raft(raft_weights, args.raft_root, args.device)
+        t_temporal_flow_model_load += time.perf_counter() - t0
+    temporal_state = {} if args.waft_temporal_init else None
 
     cap = cv2.VideoCapture(args.video)
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -406,7 +565,11 @@ def main() -> None:
             l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
             bgr_pairs.append(calib.rectify_pair(l_bgr, r_bgr, rect))
         t_rectify += time.perf_counter() - t0
-        dep_b, valid_b, _rgb_b, timing = process_batch(model, bgr_pairs, rect, fx, baseline, args)
+        dep_b, valid_b, _rgb_b, timing = process_batch(
+            model, bgr_pairs, rect, fx, baseline, args,
+            temporal_flow_model=raft if args.waft_temporal_init else None,
+            temporal_state=temporal_state,
+        )
         t_waft += timing["waft_forward"]
         t_align += timing["photo_align"]
         t_fusion += timing["center_fusion"]
@@ -417,20 +580,25 @@ def main() -> None:
             stages_seconds = {
                     key: round(float(value), 6)
                     for key, value in timing_detail.items()
-                    if isinstance(value, (int, float))
+                    if isinstance(value, (int, float)) and key != "temporal_valid_ratio"
                 }
         else:
             stages_seconds = {
                 "stereo_forward_seconds": round(float(timing["waft_forward"]), 6)
             }
-        waft_timing_records.append({
+        timing_record = {
             "batch_index": len(waft_timing_records),
             "start_frame": frame_idx,
             "end_frame": frame_idx + B,
             "batch_size": B,
             "model_samples": 2 * B if args.bi else B,
             "stages_seconds": stages_seconds,
-        })
+        }
+        if timing_detail is not None and "temporal_valid_ratio" in timing_detail:
+            timing_record["temporal_valid_ratio"] = round(
+                float(timing_detail["temporal_valid_ratio"]), 6
+            )
+        waft_timing_records.append(timing_record)
 
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
@@ -539,7 +707,6 @@ def main() -> None:
     cap.release()
     total_s = time.time() - t_all
     e2e_s = time.perf_counter() - t_program
-    proc_s = t_waft + t_align + t_fusion + t_fill + t_depth_gf + t_color + t_write
     waft_stage_seconds = {}
     for record in waft_timing_records:
         for key, value in record["stages_seconds"].items():
@@ -552,6 +719,8 @@ def main() -> None:
         "model_forward_seconds",
         waft_stage_seconds.get("stereo_forward_seconds", 0.0),
     )
+    proc_s = stereo_total_s + t_align + t_fusion + t_fill + t_depth_gf + t_color + t_write
+    temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
     timing_filename = timing_artifact_name(backend)
     stereo_timing = {
         "video": str(args.video),
@@ -562,6 +731,19 @@ def main() -> None:
         "n_frames": processed,
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
+        "waft_temporal_init": bool(args.waft_temporal_init),
+        "temporal_valid_ratio": (
+            round(temporal_valid_ratio, 6) if temporal_valid_ratio is not None else None
+        ),
+        "temporal_configuration": {
+            "flow_iters": args.waft_temporal_flow_iters,
+            "blend": args.waft_temporal_blend,
+            "photo_tol": args.waft_temporal_photo_tol,
+            "flow_abs_tol": args.waft_temporal_flow_abs_tol,
+            "flow_rel_tol": args.waft_temporal_flow_rel_tol,
+            "disp_abs_tol": args.waft_temporal_disp_abs_tol,
+            "disp_rel_tol": args.waft_temporal_disp_rel_tol,
+        } if args.waft_temporal_init else None,
         "stage_seconds": {key: round(value, 6) for key, value in waft_stage_seconds.items()},
         "average_seconds_per_batch": {
             key: round(value / max(len(waft_timing_records), 1), 6)
@@ -588,7 +770,7 @@ def main() -> None:
         "model_type": args.model_type,
         "waft_iters": args.waft_iters,
         "bidirectional": bool(args.bi),
-        "max_disp": args.max_disp if backend == "las2" else None,
+        "max_disp": args.max_disp if backend in ("las2", "ffs", "foundation") else None,
         "start_frame": args.start_frame,
         "end_frame": frame_idx,
         "n_frames": processed,
@@ -608,13 +790,31 @@ def main() -> None:
         "depth_unsharp": args.depth_unsharp,
         "temporal_raft": bool(args.temporal_raft),
         "temporal_alpha": args.temporal_alpha,
+        "waft_temporal_init": bool(args.waft_temporal_init),
+        "waft_temporal_flow_iters": args.waft_temporal_flow_iters,
+        "waft_temporal_blend": args.waft_temporal_blend,
+        "waft_temporal_photo_tol": args.waft_temporal_photo_tol,
+        "waft_temporal_flow_abs_tol": args.waft_temporal_flow_abs_tol,
+        "waft_temporal_flow_rel_tol": args.waft_temporal_flow_rel_tol,
+        "waft_temporal_disp_abs_tol": args.waft_temporal_disp_abs_tol,
+        "waft_temporal_disp_rel_tol": args.waft_temporal_disp_rel_tol,
+        "temporal_valid_ratio": (
+            round(temporal_valid_ratio, 6) if temporal_valid_ratio is not None else None
+        ),
         "depth_z": bool(args.depth_z),
+        "output_view": args.output_view,
+        "left_vis_mode": args.left_vis_mode,
         "colormap": "log_metric",
         "dmin_m": args.dmin_m,
         "dmax_m": args.dmax_m,
         "temporal_median": win,
         "temporal_ema": args.temporal_ema,
         "stage_model_load_seconds": round(t_model_load, 2),
+        "stage_temporal_flow_model_load_seconds": round(t_temporal_flow_model_load, 2),
+        "stage_temporal_flow_seconds": round(waft_stage_seconds.get("temporal_flow", 0.0), 2),
+        "stage_temporal_initialization_seconds": round(
+            waft_stage_seconds.get("temporal_initialization", 0.0), 2
+        ),
         "stage_video_decode_locate_seconds": round(t_decode, 2),
         "stage_stereo_rectify_seconds": round(t_rectify, 2),
         "stage_waft_forward_seconds": round(t_waft, 2),
@@ -629,18 +829,28 @@ def main() -> None:
         "stage_depth_colorize_seconds": round(t_color, 2),
         "stage_video_write_seconds": round(t_write, 2),
         "stage_png_write_seconds": round(t_png_write, 2),
-        "stage_stereo_fusion_fill_seconds": round(t_waft + t_align + t_fusion + t_fill + t_depth_gf, 2),
+        "stage_stereo_fusion_fill_seconds": round(
+            stereo_total_s + t_align + t_fusion + t_fill + t_depth_gf, 2
+        ),
         "stage_main_process_seconds": round(proc_s, 2),
         "stage_other_seconds": round(max(total_s - proc_s, 0), 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")
     print(f"[timing] 模型加载 {t_model_load:.2f}s")
+    if raft is not None:
+        print(f"[timing] RAFT 光流模型加载 {t_temporal_flow_model_load:.2f}s")
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
     backend_label = backend.upper()
     print(f"[timing] {backend_label} 双向前向 {t_waft:.2f}s")
     print(f"[timing] {backend_label} 输入到输出管线 {stereo_total_s:.2f}s（细分见 {timing_filename}）")
+    if args.waft_temporal_init:
+        print(f"[timing] 时序双向光流 {waft_stage_seconds.get('temporal_flow', 0.0):.2f}s")
+        print(
+            f"[timing] WAFT 时序初始化 {waft_stage_seconds.get('temporal_initialization', 0.0):.2f}s，"
+            f"有效先验比例 {temporal_valid_ratio or 0.0:.3f}"
+        )
     print(f"[timing] 双目光度对齐 {t_align:.2f}s")
     print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
     print(f"[timing] 遮挡补洞 {t_fill:.2f}s")

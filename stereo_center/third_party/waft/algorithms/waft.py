@@ -22,6 +22,107 @@ def freeze_module(module):
     for p in module.buffers():
         p.requires_grad = False
 
+
+def _backward_warp_with_flow(source, target_to_source_flow):
+    """Backward-sample source using flow defined on target coordinates."""
+    n, _c, h, w = source.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=source.device, dtype=source.dtype),
+        torch.arange(w, device=source.device, dtype=source.dtype),
+        indexing='ij',
+    )
+    sx = xx.unsqueeze(0) + target_to_source_flow[:, 0]
+    sy = yy.unsqueeze(0) + target_to_source_flow[:, 1]
+    valid = (
+        (sx >= 0.0) & (sx <= w - 1) & (sy >= 0.0) & (sy <= h - 1)
+    ).unsqueeze(1)
+    grid = torch.stack([
+        2.0 * sx / max(w - 1, 1) - 1.0,
+        2.0 * sy / max(h - 1, 1) - 1.0,
+    ], dim=-1)
+    warped = F.grid_sample(
+        source, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+    )
+    return warped, valid
+
+
+def temporal_warmstart_disparity(
+    current_disparity,
+    backward_flow,
+    temporal_mask,
+    group_size,
+    carry_disparity=None,
+    blend=0.75,
+    disparity_abs_tol=3.0,
+    disparity_rel_tol=0.15,
+):
+    """Build a confidence-gated temporal initialization for batched WAFT.
+
+    Samples are partitioned into consecutive temporal groups. Within each
+    group, frame ``t`` draws only from frame ``t-1``. The first frame can use
+    one carry disparity per group; without a carry its temporal mask is zero.
+    """
+    if current_disparity.ndim != 4 or current_disparity.shape[1] != 1:
+        raise ValueError('current_disparity must have shape (N, 1, H, W)')
+    n, _c, h, w = current_disparity.shape
+    if group_size <= 0 or n % int(group_size) != 0:
+        raise ValueError('group_size must evenly divide the sample batch')
+    if backward_flow.ndim != 4 or backward_flow.shape[:2] != (n, 2):
+        raise ValueError('backward_flow must have shape (N, 2, H, W)')
+    if temporal_mask.ndim != 4 or temporal_mask.shape[:2] != (n, 1):
+        raise ValueError('temporal_mask must have shape (N, 1, H, W)')
+
+    flow_h, flow_w = backward_flow.shape[-2:]
+    scale_x = w / max(flow_w, 1)
+    scale_y = h / max(flow_h, 1)
+    flow = F.interpolate(
+        backward_flow, size=(h, w), mode='bilinear', align_corners=True
+    )
+    flow = flow.clone()
+    flow[:, 0] *= scale_x
+    flow[:, 1] *= scale_y
+    mask = F.interpolate(temporal_mask.float(), size=(h, w), mode='bilinear', align_corners=True)
+
+    previous = current_disparity.detach().clone()
+    groups = n // int(group_size)
+    carry = None
+    if carry_disparity is not None:
+        carry = carry_disparity
+        if carry.ndim == 3:
+            carry = carry.unsqueeze(1)
+        if carry.ndim != 4 or carry.shape[:2] != (groups, 1):
+            raise ValueError('carry_disparity must have shape (groups, H, W)')
+        carry_w = carry.shape[-1]
+        carry = F.interpolate(carry.float(), size=(h, w), mode='bilinear', align_corners=True)
+        carry = carry * (w / max(carry_w, 1))
+        carry = carry.to(dtype=current_disparity.dtype, device=current_disparity.device)
+
+    for group in range(groups):
+        start = group * int(group_size)
+        end = start + int(group_size)
+        if end - start > 1:
+            previous[start + 1:end] = current_disparity[start:end - 1].detach()
+        if carry is None:
+            mask[start] = 0.0
+        else:
+            previous[start] = carry[group]
+
+    prior, in_bounds = _backward_warp_with_flow(previous, flow)
+    abs_tol = float(disparity_abs_tol) * scale_x
+    threshold = torch.maximum(
+        torch.full_like(current_disparity, abs_tol),
+        float(disparity_rel_tol) * current_disparity.abs(),
+    )
+    agreement = (prior - current_disparity).abs() <= threshold
+    effective = (
+        mask.clamp(0.0, 1.0)
+        * in_bounds.to(mask.dtype)
+        * agreement.to(mask.dtype)
+    )
+    weight = float(blend) * effective
+    warmstart = current_disparity * (1.0 - weight) + prior * weight
+    return warmstart, effective
+
 class WAFT(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -60,8 +161,10 @@ class WAFT(nn.Module):
         up_info = up_info.permute(0, 1, 4, 2, 5, 3)
         return up_info.reshape(N, C, 2*H, 2*W)
     
-    def forward(self, sample, disp_init=None, timing=None):
+    def forward(self, sample, disp_init=None, temporal_init=None, timing=None):
         """ Estimate disparity between pair of frames """
+        if disp_init is not None and temporal_init is not None:
+            raise ValueError('disp_init and temporal_init are mutually exclusive')
         output = {}
         with _timed(timing, "normalize"):
             image1 = self.normalize_image(sample['img1'])
@@ -91,6 +194,29 @@ class WAFT(nn.Module):
             if disp_init is not None:
                 disp = padder.pad(disp_init.unsqueeze(1))
                 disp = F.interpolate(disp, scale_factor=0.5, mode='bilinear', align_corners=True) * 0.5
+
+        if temporal_init is not None:
+            with _timed(timing, "temporal_initialization"):
+                temporal_flow = padder.pad(
+                    temporal_init['backward_flow'].to(device=disp.device, dtype=disp.dtype)
+                )
+                temporal_mask = padder.pad(
+                    temporal_init['mask'].to(device=disp.device, dtype=disp.dtype)
+                )
+                carry = temporal_init.get('carry_disparity')
+                if carry is not None:
+                    carry = padder.pad(carry.to(device=disp.device, dtype=disp.dtype))
+                disp, temporal_valid = temporal_warmstart_disparity(
+                    disp,
+                    temporal_flow,
+                    temporal_mask,
+                    group_size=int(temporal_init['group_size']),
+                    carry_disparity=carry,
+                    blend=float(temporal_init.get('blend', 0.75)),
+                    disparity_abs_tol=float(temporal_init.get('disparity_abs_tol', 3.0)),
+                    disparity_rel_tol=float(temporal_init.get('disparity_rel_tol', 0.15)),
+                )
+                output['temporal_valid_mask'] = temporal_valid
 
         delta_disp_preds = []
         delta_info_preds = []

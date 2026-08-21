@@ -32,6 +32,7 @@ if str(WAFT_ROOT) not in sys.path:
 from peft import PeftModel  # noqa: E402
 from bridgedepth.config import get_cfg  # noqa: E402
 from algorithms.waft import WAFT  # noqa: E402
+from stereo_center.temporal_stereo import temporal_alignment_mask  # noqa: E402
 
 WAFT_MODEL_CONFIG = {
     "DAv2S-4": "configs/SynLarge/DAv2S-4.yaml",
@@ -101,6 +102,35 @@ def load_waft(
     return model
 
 
+def _pack_temporal_reference_pairs(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    temporal_state: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack left and flipped-right frames as two independent time groups."""
+    if left.shape != right.shape or left.ndim != 4:
+        raise ValueError("left and right must have identical (B, C, H, W) shapes")
+    batch = left.shape[0]
+    current = torch.cat((left, torch.flip(right, dims=[3])), dim=0)
+    previous = current.clone()
+    boundary = torch.ones(
+        current.shape[0], 1, current.shape[2], current.shape[3],
+        device=current.device, dtype=current.dtype,
+    )
+    carry_images = temporal_state.get("previous_reference_images")
+    for group, start in enumerate((0, batch)):
+        end = start + batch
+        if batch > 1:
+            previous[start + 1:end] = current[start:end - 1]
+        if carry_images is None:
+            boundary[start] = 0.0
+        else:
+            if carry_images.shape != (2, *current.shape[1:]):
+                raise ValueError("temporal carry images do not match the current frame shape")
+            previous[start] = carry_images[group].to(current)
+    return current, previous, boundary
+
+
 def _run_once(
     model: WAFT,
     left: torch.Tensor,
@@ -108,16 +138,19 @@ def _run_once(
     hiera_mode: str,
     use_amp: bool,
     timing: _TimingRecorder | None = None,
+    temporal_init: dict | None = None,
 ) -> tuple[dict, float]:
     """单方向推理：direct 用 model(sample)，hiera 用 0.5->1.0 由粗到细。"""
     sample = {"img1": left, "img2": right}
     if hiera_mode == "hiera":
+        if temporal_init is not None:
+            raise ValueError("WAFT temporal initialization supports direct inference only")
         def forward():
             return model.heirarchical_inference(
                 sample, size=None, factor_list=[0.5, 1.0], timing=timing
             )
     else:
-        forward = lambda: model(sample, timing=timing)
+        forward = lambda: model(sample, temporal_init=temporal_init, timing=timing)
 
     if left.device.type == "cuda":
         torch.cuda.synchronize(left.device)
@@ -145,6 +178,7 @@ def _run_bidirectional_once(
     hiera_mode: str,
     use_amp: bool,
     timing: _TimingRecorder | None = None,
+    temporal_init: dict | None = None,
 ) -> tuple[dict, int, float]:
     """把左右两个方向拼为一个 2B 前向，减少一次模型调度和重复开销。"""
     batch = left.shape[0]
@@ -155,7 +189,10 @@ def _run_bidirectional_once(
     with pack_context:
         left_bi = torch.cat((left, torch.flip(right, dims=[3])), dim=0)
         right_bi = torch.cat((right, torch.flip(left, dims=[3])), dim=0)
-    out, elapsed = _run_once(model, left_bi, right_bi, hiera_mode, use_amp, timing=timing)
+    out, elapsed = _run_once(
+        model, left_bi, right_bi, hiera_mode, use_amp,
+        timing=timing, temporal_init=temporal_init,
+    )
     return out, batch, elapsed
 
 
@@ -450,6 +487,74 @@ def run_stereo_matching_bi(
 
 
 @torch.no_grad()
+def run_stereo_matching_batch(
+    model: WAFT,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    device: str = "cuda",
+    use_amp: bool = True,
+    hiera: str = "auto",
+    conf_mode: str = "info",
+    occ_mode: str = "visibility",
+    timing_out: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """批量单向左参考视差推理（左相机视角深度视频用）。
+
+    left/right: (B, 3, H, W) 0-255 float RGB。
+
+    Returns:
+        disp/occ/conf: (B, H, W) float32 CPU tensor；
+        elapsed: 模型前向耗时。
+    """
+    H, W = left.shape[-2:]
+    hiera_mode = _resolve_hiera(hiera, H, W)
+    if hiera_mode not in ("direct", "hiera"):
+        raise ValueError(f"未知推理模式: {hiera}（可选 auto/direct/hiera）")
+    if conf_mode not in ("info", "ones"):
+        raise ValueError("单向 batch 推理 conf_mode 仅支持 info/ones")
+    if occ_mode != "visibility":
+        raise ValueError("单向 batch 推理 occ_mode 仅支持 visibility")
+
+    recorder = _TimingRecorder(device) if timing_out is not None else None
+    t_total = time.perf_counter()
+    if recorder is not None:
+        with recorder.measure("input_transfer"):
+            lt = left.to(device)
+            rt = right.to(device)
+    else:
+        lt = left.to(device)
+        rt = right.to(device)
+
+    out_l, elapsed = _run_once(model, lt, rt, hiera_mode, use_amp, timing=recorder)
+    if recorder is not None:
+        split_context = recorder.measure("output_split_flip")
+    else:
+        split_context = nullcontext()
+    with split_context:
+        disp = out_l["disp_pred"].float()
+        info = out_l["delta_info_preds"][-1]
+
+    if recorder is not None:
+        post_context = recorder.measure("confidence_occ_postprocess")
+    else:
+        post_context = nullcontext()
+    with post_context:
+        occ = _visibility_mask_batch(disp, H, W)
+        conf = _conf_from_info_batch(info, conf_mode, disp)
+
+    if recorder is not None:
+        with recorder.measure("output_cpu_transfer"):
+            result = disp.cpu(), occ.cpu(), conf.cpu(), elapsed
+        recorder._sync()
+        timing_out.update(recorder.stages)
+        timing_out["waft_total_seconds"] = time.perf_counter() - t_total
+        timing_out["model_forward_seconds"] = recorder.stages.get("model_forward", elapsed)
+    else:
+        result = disp.cpu(), occ.cpu(), conf.cpu(), elapsed
+    return result
+
+
+@torch.no_grad()
 def run_stereo_matching_bi_batch(
     model: WAFT,
     left: torch.Tensor,
@@ -460,6 +565,15 @@ def run_stereo_matching_bi_batch(
     conf_mode: str = "lr",
     occ_mode: str = "lr",
     timing_out: dict | None = None,
+    temporal_flow_model: torch.nn.Module | None = None,
+    temporal_state: dict | None = None,
+    temporal_flow_iters: int = 12,
+    temporal_blend: float = 0.75,
+    temporal_photo_tol: float = 40.0,
+    temporal_flow_abs_tol: float = 0.5,
+    temporal_flow_rel_tol: float = 0.01,
+    temporal_disp_abs_tol: float = 3.0,
+    temporal_disp_rel_tol: float = 0.15,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """批量双向视差推理（深度视频用）。
 
@@ -486,9 +600,68 @@ def run_stereo_matching_bi_batch(
     else:
         lt = left.to(device)
         rt = right.to(device)
+    temporal_init = None
+    if temporal_flow_model is not None:
+        if hiera_mode != "direct":
+            raise ValueError("WAFT temporal initialization supports direct inference only")
+        if temporal_state is None:
+            raise ValueError("temporal_state is required with temporal_flow_model")
+        from stereo_center.raft_flow import flow_between
+
+        if recorder is not None:
+            temporal_context = recorder.measure("temporal_flow")
+        else:
+            temporal_context = nullcontext()
+        with temporal_context:
+            current_refs, previous_refs, boundary_mask = _pack_temporal_reference_pairs(
+                lt, rt, temporal_state
+            )
+            backward_flow = flow_between(
+                temporal_flow_model,
+                current_refs,
+                previous_refs,
+                iters=int(temporal_flow_iters),
+            )
+            forward_flow = flow_between(
+                temporal_flow_model,
+                previous_refs,
+                current_refs,
+                iters=int(temporal_flow_iters),
+            )
+            temporal_mask = temporal_alignment_mask(
+                current_refs,
+                previous_refs,
+                forward_flow,
+                backward_flow,
+                photo_tol=float(temporal_photo_tol),
+                flow_abs_tol=float(temporal_flow_abs_tol),
+                flow_rel_tol=float(temporal_flow_rel_tol),
+            ) * boundary_mask
+        temporal_init = {
+            "backward_flow": backward_flow,
+            "mask": temporal_mask,
+            "group_size": left.shape[0],
+            "carry_disparity": temporal_state.get("previous_disparities"),
+            "blend": float(temporal_blend),
+            "disparity_abs_tol": float(temporal_disp_abs_tol),
+            "disparity_rel_tol": float(temporal_disp_rel_tol),
+        }
     out_bi, batch, elapsed = _run_bidirectional_once(
-        model, lt, rt, hiera_mode, use_amp, timing=recorder
+        model, lt, rt, hiera_mode, use_amp, timing=recorder,
+        temporal_init=temporal_init,
     )
+    if temporal_flow_model is not None:
+        temporal_state["previous_reference_images"] = torch.stack(
+            (lt[-1], torch.flip(rt[-1], dims=[2])), dim=0
+        ).detach()
+        temporal_state["previous_disparities"] = torch.stack(
+            (out_bi["disp_pred"][batch - 1], out_bi["disp_pred"][2 * batch - 1]),
+            dim=0,
+        ).detach()
+        if timing_out is not None and "temporal_valid_mask" in out_bi:
+            timing_out["temporal_valid_ratio"] = float(
+                out_bi["temporal_valid_mask"].float().mean().item()
+            )
     if recorder is not None:
         with recorder.measure("output_split_flip"):
             dL = out_bi["disp_pred"][:batch].float()
