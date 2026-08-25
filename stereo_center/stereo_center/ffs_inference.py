@@ -237,6 +237,25 @@ def _lr_consistency(dL: torch.Tensor, dR: torch.Tensor) -> tuple[torch.Tensor, t
     return occL.float(), occR.float()
 
 
+def _lr_confidence(dL: torch.Tensor, dR: torch.Tensor) -> torch.Tensor:
+    """Smooth confidence from left-right disparity agreement.
+
+    For each reference pixel, sample the opposite-view disparity at x - d and
+    convert the absolute mismatch to exp(-err / max(1px, 5% disparity)).
+    Pixels whose correspondence leaves the image receive confidence 0.
+    """
+    B, H, W = dL.shape
+    yy = torch.linspace(-1, 1, H, device=dL.device).view(1, H, 1).expand(B, H, W)
+    xx = torch.arange(W, device=dL.device).float()
+    xgrid = xx.view(1, 1, W)
+    x_match = xgrid - dL
+    grid = torch.stack([((x_match) / max(W - 1, 1) * 2 - 1).clamp(-1, 1), yy], dim=-1)
+    dR_at_L = F.grid_sample(dR.unsqueeze(1), grid, mode="bilinear", align_corners=True)[:, 0]
+    thresh = torch.maximum(torch.ones_like(dL), 0.05 * dL)
+    conf = torch.exp(-(dL - dR_at_L).abs() / thresh.clamp_min(1e-3))
+    return conf * (x_match >= 0).float()
+
+
 @torch.no_grad()
 def run_stereo_matching(
     model: FFSModel,
@@ -251,7 +270,9 @@ def run_stereo_matching(
     d, elapsed = _run_once(model, left.to(device), right.to(device), use_amp)
     occ = _visibility(d)
     conf = torch.ones_like(d)
-    return d[0], occ[0], conf[0], elapsed
+    if d.shape[0] == 1:
+        return d[0], occ[0], conf[0], elapsed
+    return d, occ, conf, elapsed
 
 
 @torch.no_grad()
@@ -279,8 +300,12 @@ def run_stereo_matching_bi_batch(
     else:
         occL = _visibility(dL)
         occR = _visibility(dR)
-    confL = torch.ones_like(dL)
-    confR = torch.ones_like(dR)
+    if conf_mode == "lr":
+        confL = _lr_confidence(dL.to(device), dR.to(device)).cpu()
+        confR = _lr_confidence(dR.to(device), dL.to(device)).cpu()
+    else:
+        confL = torch.ones_like(dL)
+        confR = torch.ones_like(dR)
     return dL, dR, occL, occR, confL, confR, elapsed
 
 

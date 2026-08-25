@@ -19,19 +19,6 @@ class DepthVideoTimingTests(unittest.TestCase):
         self.assertEqual(run_depth_video.timing_artifact_name("waft"), "waft_timing.json")
         self.assertEqual(run_depth_video.timing_artifact_name("ffs"), "ffs_timing.json")
         self.assertEqual(run_depth_video.timing_artifact_name("las2"), "las2_timing.json")
-        self.assertEqual(run_depth_video.timing_artifact_name("foundation"), "foundation_timing.json")
-
-    def test_resolve_weights_dir_accepts_foundation_env_var(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            old = os.environ.get("FOUNDATION_WEIGHTS_DIR")
-            os.environ["FOUNDATION_WEIGHTS_DIR"] = tmp
-            try:
-                self.assertEqual(run_depth_video.resolve_weights_dir(None, "foundation"), Path(tmp))
-            finally:
-                if old is None:
-                    os.environ.pop("FOUNDATION_WEIGHTS_DIR", None)
-                else:
-                    os.environ["FOUNDATION_WEIGHTS_DIR"] = old
 
     def test_temporal_initialization_accepts_only_bi_waft_direct_mode(self):
         valid = SimpleNamespace(
@@ -68,6 +55,31 @@ class DepthVideoTimingTests(unittest.TestCase):
         self.assertEqual(args.waft_temporal_flow_rel_tol, 0.01)
         self.assertEqual(args.waft_temporal_disp_abs_tol, 3.0)
         self.assertEqual(args.waft_temporal_disp_rel_tol, 0.15)
+
+    def test_model_iteration_cli_uses_unified_iters(self):
+        parser = argparse.ArgumentParser()
+        run_depth_video.add_model_iteration_arguments(parser)
+
+        self.assertIsNone(parser.parse_args([]).iters)
+        self.assertEqual(parser.parse_args(["--iters", "5"]).iters, 5)
+        self.assertEqual(parser.parse_args(["--waft-iters", "4"]).iters, 4)
+        self.assertEqual(parser.parse_args(["--ffs-valid-iters", "8"]).iters, 8)
+
+        help_text = parser.format_help()
+        self.assertIn("--iters", help_text)
+        self.assertNotIn("--waft-iters", help_text)
+        self.assertNotIn("--ffs-valid-iters", help_text)
+
+    def test_model_iteration_defaults_preserve_backend_behavior(self):
+        self.assertIsNone(run_depth_video.resolve_model_iters("waft", None))
+        self.assertEqual(run_depth_video.resolve_model_iters("ffs", None), 8)
+        self.assertEqual(run_depth_video.resolve_model_iters("waft", 5), 5)
+        self.assertEqual(run_depth_video.resolve_model_iters("ffs", 6), 6)
+
+    def test_processing_end_is_clamped_to_available_pts_pairs(self):
+        self.assertEqual(run_depth_video.resolve_processing_end(973, 0, -1, 0), 973)
+        self.assertEqual(run_depth_video.resolve_processing_end(973, 968, 983, 0), 973)
+        self.assertEqual(run_depth_video.resolve_processing_end(973, 968, -1, 3), 971)
 
     def test_waft_temporal_kwargs_are_disabled_without_mode(self):
         args = SimpleNamespace(

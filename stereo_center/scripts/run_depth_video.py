@@ -34,6 +34,13 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
         sys.path.insert(0, str(_p))
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
+from stereo_center.orbbec import (  # noqa: E402
+    forward_decode_read_count,
+    load_pts_us,
+    match_left_to_right_pts,
+    pts_metadata_mismatch,
+    pts_sidecar_path,
+)
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.guided_filter import guided_filter  # noqa: E402
 from stereo_center.raft_flow import flow_between, load_raft  # noqa: E402
@@ -51,7 +58,6 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
         "s2m2": "S2M2_WEIGHTS_DIR",
         "las2": "LAS2_WEIGHTS_DIR",
         "ffs": "FFS_WEIGHTS_DIR",
-        "foundation": "FOUNDATION_WEIGHTS_DIR",
     }
     env = env_map[backend]
     if env in os.environ:
@@ -63,8 +69,6 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
         subs = ["waft"]
     elif backend == "ffs":
         subs = ["fast_foundation_stereo", "pretrain_weights"]
-    elif backend == "foundation":
-        subs = ["foundation_stereo", "FoundationStereo/pretrained_models/23-51-11"]
     else:
         subs = ["pretrain_weights"]
     for sub in subs:
@@ -83,6 +87,38 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
 def timing_artifact_name(backend: str) -> str:
     """Return backend-specific timing artifact filename."""
     return f"{backend}_timing.json"
+
+
+def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the public model refinement iteration flag and legacy aliases."""
+    parser.add_argument(
+        "--iters", type=int, default=None,
+        help=(
+            "模型测试阶段视差迭代细化轮数；WAFT 默认取模型配置，"
+            "FFS 默认 8"
+        ),
+    )
+    parser.add_argument("--waft-iters", dest="iters", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--ffs-valid-iters", dest="iters", type=int, help=argparse.SUPPRESS)
+
+
+def resolve_model_iters(backend: str, iters: int | None) -> int | None:
+    """Resolve backend defaults while keeping the public CLI name as --iters."""
+    if iters is not None:
+        return int(iters)
+    if backend == "ffs":
+        return 8
+    return None
+
+
+def resolve_processing_end(
+    n_total: int, start_frame: int, requested_end: int, max_frames: int
+) -> int:
+    """Limit the requested range to frames that actually have stereo pairs."""
+    end = n_total if requested_end < 0 else min(requested_end, n_total)
+    if max_frames > 0:
+        end = min(end, start_frame + max_frames)
+    return end
 
 
 def validate_waft_temporal_mode(args, hiera_mode: str) -> None:
@@ -364,24 +400,28 @@ def process_batch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="批量中心深度视频生成（米制色阶）")
-    parser.add_argument("--video", type=str, required=True)
-    parser.add_argument("--calib", type=str, required=True)
+    parser.add_argument("--video", type=str, required=True, help="SBS 视频，或独立左相机视频")
+    parser.add_argument("--video-right", type=str, default=None, help="独立右相机视频；提供后按 PTS 配对")
+    parser.add_argument("--left-pts", type=str, default=None, help="左视频 timestamp_us CSV（默认自动查找）")
+    parser.add_argument("--right-pts", type=str, default=None, help="右视频 timestamp_us CSV（默认自动查找）")
+    parser.add_argument(
+        "--pts-match-tolerance-ms", type=float, default=8.0,
+        help="独立双目流的最近 PTS 配对容差（毫秒）",
+    )
+    parser.add_argument("--calib", type=str, required=True, help="VDEgo JSON 或 Orbbec 相机 YAML")
     parser.add_argument("--scale", type=float, default=0.5, help="校正输出缩放（建议 0.5）")
-    parser.add_argument("--batch-size", type=int, default=4, help="WAFT 前向 batch（s0.5 建议 4）")
+    parser.add_argument("--batch-size", type=int, default=4, help="模型前向 batch（s0.5 建议 4）")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int, default=-1, help="-1=到视频末尾")
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "foundation"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
-    parser.add_argument("--ffs-valid-iters", type=int, default=8, help="FFS recurrent refinement iterations")
-    parser.add_argument("--foundation-root", type=str, default=None, help="FoundationStereo 仓库根目录（原版 FoundationStereo）")
-    parser.add_argument("--foundation-valid-iters", type=int, default=32, help="FoundationStereo recurrent refinement iterations")
-    parser.add_argument("--waft-iters", type=int, default=None, help="WAFT 迭代轮数（默认取配置 4；2/3 可提速）")
+    add_model_iteration_arguments(parser)
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--hiera", type=str, default="auto", choices=["auto", "direct", "hiera"])
@@ -457,6 +497,7 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
+    model_iters = resolve_model_iters(backend, args.iters)
 
     t_model_load = 0.0
     t_temporal_flow_model_load = 0.0
@@ -472,7 +513,8 @@ def main() -> None:
     t_png_write = 0.0
     waft_timing_records = []
 
-    cal = calib.load_vdego_calibration(args.calib)
+    calib_loader = calib.load_orbbec_calibration if Path(args.calib).suffix.lower() in {".yaml", ".yml"} else calib.load_vdego_calibration
+    cal = calib_loader(args.calib)
     out_size = (
         max(32, int(cal["resolution"][0] * args.scale)),
         max(32, int(cal["resolution"][1] * args.scale)),
@@ -494,10 +536,9 @@ def main() -> None:
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
         ffs_root=args.ffs_root,
-        foundation_root=args.foundation_root,
-        valid_iters=args.foundation_valid_iters if backend == "foundation" else args.ffs_valid_iters,
+        valid_iters=model_iters,
         hiera=args.hiera,
-        iters=args.waft_iters,
+        iters=model_iters,
     )
     t_model_load += time.perf_counter() - t0
     raft = None
@@ -513,12 +554,48 @@ def main() -> None:
     temporal_state = {} if args.waft_temporal_init else None
 
     cap = cv2.VideoCapture(args.video)
-    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开左/SBS 视频: {args.video}")
+    cap_right = cv2.VideoCapture(args.video_right) if args.video_right else None
+    if cap_right is not None and not cap_right.isOpened():
+        raise RuntimeError(f"无法打开右视频: {args.video_right}")
+    paired_indices = None
+    n_left_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if cap_right is not None:
+        left_pts_path = Path(args.left_pts) if args.left_pts else pts_sidecar_path(args.video)
+        right_pts_path = Path(args.right_pts) if args.right_pts else pts_sidecar_path(args.video_right)
+        if not left_pts_path.is_file() or not right_pts_path.is_file():
+            raise FileNotFoundError(
+                "独立左右视频必须提供 PTS CSV；可用 --left-pts/--right-pts 显式指定"
+            )
+        left_pts = load_pts_us(left_pts_path)
+        right_pts = load_pts_us(right_pts_path)
+        n_right_total = int(cap_right.get(cv2.CAP_PROP_FRAME_COUNT))
+        if pts_metadata_mismatch(len(left_pts), len(right_pts), n_left_total, n_right_total):
+            # Some segmented H.264 files advertise a frame count larger than
+            # their decodable frames. Device PTS is the recording's frame index.
+            print(
+                f"[sync] 容器帧数 {n_left_total}/{n_right_total} 与 PTS "
+                f"{len(left_pts)}/{len(right_pts)} 不一致，按 PTS 配对"
+            )
+        paired_indices, sync_offsets_us = match_left_to_right_pts(
+            left_pts, right_pts, round(args.pts_match_tolerance_ms * 1000),
+        )
+        if not paired_indices:
+            raise ValueError("没有 PTS 差值在容差内的双目帧对")
+        n_total = len(paired_indices)
+        print(
+            f"[sync] PTS 配对 {n_total}/{n_left_total} 左帧，"
+            f"中位偏差={np.median(sync_offsets_us) / 1000:.3f}ms，"
+            f"最大偏差={sync_offsets_us.max() / 1000:.3f}ms"
+        )
+    else:
+        n_total = n_left_total
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     fps = args.fps if args.fps > 0 else float(src_fps)
-    end = args.end_frame if args.end_frame >= 0 else n_total
-    if args.max_frames > 0:
-        end = min(end, args.start_frame + args.max_frames)
+    end = resolve_processing_end(
+        n_total, args.start_frame, args.end_frame, args.max_frames
+    )
     print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
 
     cv2.imwrite(
@@ -541,19 +618,65 @@ def main() -> None:
     prev_depth = None
     prev_left_t = None
     prev_depth_t = None
+    split_left_previous_idx = None
+    split_right_previous_idx = None
+    split_right_cached = None
     flow_params = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=3,
                        poly_n=5, poly_sigma=1.2, flags=0)
     frame_idx = args.start_frame
     processed = 0
     while frame_idx < end:
         batch_frames = []
+        source_frame_indices = []
         t0 = time.perf_counter()
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        for _ in range(min(args.batch_size, end - frame_idx)):
-            ok, img = cap.read()
-            if not ok:
-                break
-            batch_frames.append(img)
+        if paired_indices is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            for source_idx in range(frame_idx, frame_idx + min(args.batch_size, end - frame_idx)):
+                ok, img = cap.read()
+                if not ok:
+                    break
+                batch_frames.append(img)
+                source_frame_indices.append(source_idx)
+        else:
+            requested_pairs = paired_indices[
+                frame_idx: frame_idx + min(args.batch_size, end - frame_idx)
+            ]
+            for left_idx, right_idx in requested_pairs:
+                left_reads = forward_decode_read_count(split_left_previous_idx, left_idx)
+                if left_reads is None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, left_idx)
+                    left_reads = 1
+                ok_left = False
+                for _ in range(left_reads):
+                    ok_left, left_img = cap.read()
+                    if not ok_left:
+                        break
+                split_left_previous_idx = left_idx
+
+                right_reads = forward_decode_read_count(split_right_previous_idx, right_idx)
+                if right_reads is None:
+                    cap_right.set(cv2.CAP_PROP_POS_FRAMES, right_idx)
+                    right_reads = 1
+                ok_right = True
+                if right_reads:
+                    for _ in range(right_reads):
+                        ok_right, right_img = cap_right.read()
+                        if not ok_right:
+                            break
+                    split_right_cached = right_img if ok_right else None
+                else:
+                    right_img = split_right_cached
+                    ok_right = right_img is not None
+                split_right_previous_idx = right_idx
+                if not ok_left or not ok_right:
+                    break
+                batch_frames.append((left_img, right_img))
+                source_frame_indices.append(left_idx)
+            if len(batch_frames) != len(requested_pairs):
+                raise RuntimeError(
+                    "PTS 配对帧无法完整解码："
+                    f"请求 {len(requested_pairs)} 帧，仅读取 {len(batch_frames)} 帧"
+                )
         t_decode += time.perf_counter() - t0
         if not batch_frames:
             break
@@ -562,7 +685,10 @@ def main() -> None:
         bgr_pairs = []
         t0 = time.perf_counter()
         for img in batch_frames:
-            l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
+            if paired_indices is None:
+                l_bgr, r_bgr = img[:, : img.shape[1] // 2], img[:, img.shape[1] // 2 :]
+            else:
+                l_bgr, r_bgr = img
             bgr_pairs.append(calib.rectify_pair(l_bgr, r_bgr, rect))
         t_rectify += time.perf_counter() - t0
         dep_b, valid_b, _rgb_b, timing = process_batch(
@@ -588,8 +714,8 @@ def main() -> None:
             }
         timing_record = {
             "batch_index": len(waft_timing_records),
-            "start_frame": frame_idx,
-            "end_frame": frame_idx + B,
+            "start_frame": source_frame_indices[0],
+            "end_frame": source_frame_indices[-1] + 1,
             "batch_size": B,
             "model_samples": 2 * B if args.bi else B,
             "stages_seconds": stages_seconds,
@@ -637,7 +763,7 @@ def main() -> None:
                     g = F.avg_pool2d(g, 7, stride=1, padding=3)
                     if os.environ.get("SAV_DEBUG_GATE"):
                         print(
-                            f"[gate] frame={frame_idx + b} g_photo={g_photo.mean().item():.3f} "
+                            f"[gate] frame={source_frame_indices[b]} g_photo={g_photo.mean().item():.3f} "
                             f"g_depth={g_depth.mean().item():.3f} g={g.mean().item():.3f}",
                             flush=True,
                         )
@@ -683,7 +809,7 @@ def main() -> None:
             writer.write(depth_img)
             if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
                 t_png0 = time.perf_counter()
-                cv2.imwrite(str(outdir / f"frame_{frame_idx + b:05d}.png"), depth_img)
+                cv2.imwrite(str(outdir / f"frame_{source_frame_indices[b]:05d}.png"), depth_img)
                 t_png_write += time.perf_counter() - t_png0
             if args.save_depth_npy:
                 np.save(
@@ -705,6 +831,8 @@ def main() -> None:
 
     writer.release()
     cap.release()
+    if cap_right is not None:
+        cap_right.release()
     total_s = time.time() - t_all
     e2e_s = time.perf_counter() - t_program
     waft_stage_seconds = {}
@@ -728,6 +856,7 @@ def main() -> None:
         "model_type": args.model_type,
         "bidirectional": bool(args.bi),
         "batch_size": args.batch_size,
+        "iters": model_iters,
         "n_frames": processed,
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
@@ -768,9 +897,9 @@ def main() -> None:
         "batch_size": args.batch_size,
         "stereo_backend": backend,
         "model_type": args.model_type,
-        "waft_iters": args.waft_iters,
+        "iters": model_iters,
         "bidirectional": bool(args.bi),
-        "max_disp": args.max_disp if backend in ("las2", "ffs", "foundation") else None,
+        "max_disp": args.max_disp if backend in ("las2", "ffs") else None,
         "start_frame": args.start_frame,
         "end_frame": frame_idx,
         "n_frames": processed,
