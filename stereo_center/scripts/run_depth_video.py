@@ -43,6 +43,7 @@ from stereo_center.orbbec import (  # noqa: E402
 )
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.guided_filter import guided_filter  # noqa: E402
+from stereo_center.left_hole_fill import fill_small_left_holes  # noqa: E402
 from stereo_center.raft_flow import flow_between, load_raft  # noqa: E402
 from stereo_center.visualize import (  # noqa: E402
     colorize_depth_log,
@@ -130,6 +131,22 @@ def add_opencv_sgbm_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_left_hole_fill_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add conservative left-view visualization hole-fill controls."""
+    parser.add_argument(
+        "--left-hole-fill", type=int, default=0, choices=[0, 1],
+        help="左视角小孔洞 RGB 门控补全（仅美化可视化，默认关闭）",
+    )
+    parser.add_argument(
+        "--left-hole-fill-max-area", type=int, default=256,
+        help="允许补全的无效连通域最大面积（像素）",
+    )
+    parser.add_argument(
+        "--left-hole-fill-color-tol", type=float, default=20.0,
+        help="孔洞与有效边界的灰度差容差（0-255）",
+    )
+
+
 def opencv_bm_parameters(args) -> dict[str, int]:
     """Return the StereoBM configuration stored with an experiment artifact."""
     return {
@@ -161,6 +178,15 @@ def opencv_sgbm_parameters(args) -> dict[str, int | str]:
     }
 
 
+def left_hole_fill_parameters(args) -> dict[str, bool | int | float]:
+    """Return left-view small-hole fill configuration stored with an artifact."""
+    return {
+        "enabled": bool(args.left_hole_fill),
+        "max_area": int(args.left_hole_fill_max_area),
+        "color_tol": float(args.left_hole_fill_color_tol),
+    }
+
+
 def resolve_model_iters(backend: str, iters: int | None) -> int | None:
     """Resolve backend defaults while keeping the public CLI name as --iters."""
     if iters is not None:
@@ -178,6 +204,12 @@ def validate_backend_mode(args) -> None:
         raise ValueError(
             f"{args.stereo_backend} only supports --output-view left with --bi=0"
         )
+
+
+def validate_left_hole_fill_mode(args) -> None:
+    """Prevent a left-reference visualization filter from touching center depth."""
+    if args.left_hole_fill and args.output_view != "left":
+        raise ValueError("--left-hole-fill is available only for left-view output")
 
 
 def resolve_processing_end(
@@ -499,6 +531,7 @@ def main() -> None:
     add_model_iteration_arguments(parser)
     add_opencv_bm_arguments(parser)
     add_opencv_sgbm_arguments(parser)
+    add_left_hole_fill_arguments(parser)
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--hiera", type=str, default="auto", choices=["auto", "direct", "hiera"])
@@ -575,6 +608,7 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
     validate_backend_mode(args)
+    validate_left_hole_fill_mode(args)
     if backend in ("opencv_bm", "opencv_sgbm") and args.model_type == "DAv2L-5":
         args.model_type = "StereoBM" if backend == "opencv_bm" else "StereoSGBM"
     model_iters = resolve_model_iters(backend, args.iters)
@@ -587,10 +621,13 @@ def main() -> None:
     t_align = 0.0
     t_fusion = 0.0
     t_fill = 0.0
+    t_left_hole_fill = 0.0
     t_depth_gf = 0.0
     t_color = 0.0
     t_write = 0.0
     t_png_write = 0.0
+    left_hole_fill_components = 0
+    left_hole_fill_pixels = 0
     waft_timing_records = []
 
     calib_loader = calib.load_orbbec_calibration if Path(args.calib).suffix.lower() in {".yaml", ".yml"} else calib.load_vdego_calibration
@@ -871,6 +908,16 @@ def main() -> None:
                 prev_depth_t = d_cur.detach()
             dep_np = d_cur[0, 0].cpu().numpy()
             valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
+            if args.left_hole_fill:
+                t0 = time.perf_counter()
+                dep_np, valid_np, fill_stats = fill_small_left_holes(
+                    dep_np, valid_np, rL_bgr,
+                    max_area=args.left_hole_fill_max_area,
+                    color_tol=args.left_hole_fill_color_tol,
+                )
+                t_left_hole_fill += time.perf_counter() - t0
+                left_hole_fill_components += fill_stats["filled_components"]
+                left_hole_fill_pixels += fill_stats["filled_pixels"]
             if args.spatial_median > 1:
                 dep_np = cv2.medianBlur(dep_np, args.spatial_median)
             # 时间 EMA：默认用光流把上一帧深度 warp 到当前帧再融合（运动补偿）
@@ -943,7 +990,10 @@ def main() -> None:
         "model_forward_seconds",
         waft_stage_seconds.get("stereo_forward_seconds", 0.0),
     )
-    proc_s = stereo_total_s + t_align + t_fusion + t_fill + t_depth_gf + t_color + t_write
+    proc_s = (
+        stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill
+        + t_depth_gf + t_color + t_write
+    )
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
     timing_filename = timing_artifact_name(backend)
     stereo_timing = {
@@ -956,6 +1006,12 @@ def main() -> None:
         "iters": model_iters,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
+        "left_hole_fill": {
+            **left_hole_fill_parameters(args),
+            "seconds": round(t_left_hole_fill, 6),
+            "filled_components": left_hole_fill_components,
+            "filled_pixels": left_hole_fill_pixels,
+        },
         "n_frames": processed,
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
@@ -1000,6 +1056,11 @@ def main() -> None:
         "bidirectional": bool(args.bi),
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
+        "left_hole_fill": {
+            **left_hole_fill_parameters(args),
+            "filled_components": left_hole_fill_components,
+            "filled_pixels": left_hole_fill_pixels,
+        },
         "max_disp": args.max_disp if backend in ("las2", "ffs") else None,
         "start_frame": args.start_frame,
         "end_frame": frame_idx,
@@ -1055,12 +1116,13 @@ def main() -> None:
         "stage_photometric_align_seconds": round(t_align, 2),
         "stage_center_fusion_seconds": round(t_fusion, 2),
         "stage_disocclusion_fill_seconds": round(t_fill, 2),
+        "stage_left_hole_fill_seconds": round(t_left_hole_fill, 2),
         "stage_depth_gf_seconds": round(t_depth_gf, 2),
         "stage_depth_colorize_seconds": round(t_color, 2),
         "stage_video_write_seconds": round(t_write, 2),
         "stage_png_write_seconds": round(t_png_write, 2),
         "stage_stereo_fusion_fill_seconds": round(
-            stereo_total_s + t_align + t_fusion + t_fill + t_depth_gf, 2
+            stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill + t_depth_gf, 2
         ),
         "stage_main_process_seconds": round(proc_s, 2),
         "stage_other_seconds": round(max(total_s - proc_s, 0), 2),
@@ -1085,6 +1147,7 @@ def main() -> None:
     print(f"[timing] 双目光度对齐 {t_align:.2f}s")
     print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
     print(f"[timing] 遮挡补洞 {t_fill:.2f}s")
+    print(f"[timing] 左视角小孔洞补全 {t_left_hole_fill:.2f}s")
     print(f"[timing] 深度着色 {t_color:.2f}s")
     print(f"[timing] 视频写盘 {t_write:.2f}s（其中 PNG {t_png_write:.2f}s）")
     print(f"[timing] 脚本总耗时 {total_s:.2f}s")

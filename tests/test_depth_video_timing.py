@@ -136,6 +136,33 @@ class DepthVideoTimingTests(unittest.TestCase):
             },
         )
 
+    def test_left_hole_fill_cli_defaults_and_metadata(self):
+        parser = argparse.ArgumentParser()
+        run_depth_video.add_left_hole_fill_arguments(parser)
+
+        args = parser.parse_args([])
+
+        self.assertEqual(args.left_hole_fill, 0)
+        self.assertEqual(args.left_hole_fill_max_area, 256)
+        self.assertEqual(args.left_hole_fill_color_tol, 20.0)
+        self.assertEqual(
+            run_depth_video.left_hole_fill_parameters(args),
+            {
+                "enabled": False,
+                "max_area": 256,
+                "color_tol": 20.0,
+            },
+        )
+
+    def test_left_hole_fill_is_limited_to_left_view(self):
+        run_depth_video.validate_left_hole_fill_mode(
+            SimpleNamespace(left_hole_fill=1, output_view="left")
+        )
+        with self.assertRaisesRegex(ValueError, "left-view"):
+            run_depth_video.validate_left_hole_fill_mode(
+                SimpleNamespace(left_hole_fill=1, output_view="center")
+            )
+
     def test_temporal_initialization_accepts_only_bi_waft_direct_mode(self):
         valid = SimpleNamespace(
             waft_temporal_init=1,
