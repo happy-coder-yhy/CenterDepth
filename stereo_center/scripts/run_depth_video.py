@@ -51,7 +51,7 @@ from stereo_center.visualize import (  # noqa: E402
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
-    if backend == "opencv_bm":
+    if backend in ("opencv_bm", "opencv_sgbm"):
         return Path(".")
     if explicit:
         return Path(explicit)
@@ -114,6 +114,22 @@ def add_opencv_bm_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bm-disp12-max-diff", type=int, default=1)
 
 
+def add_opencv_sgbm_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add OpenCV StereoSGBM parameters in OpenCV's native units."""
+    parser.add_argument("--sgbm-min-disparity", type=int, default=0)
+    parser.add_argument("--sgbm-num-disparities", type=int, default=128)
+    parser.add_argument("--sgbm-block-size", type=int, default=5)
+    parser.add_argument("--sgbm-p1", type=int, default=None)
+    parser.add_argument("--sgbm-p2", type=int, default=None)
+    parser.add_argument("--sgbm-disp12-max-diff", type=int, default=1)
+    parser.add_argument("--sgbm-uniqueness-ratio", type=int, default=10)
+    parser.add_argument("--sgbm-speckle-window-size", type=int, default=100)
+    parser.add_argument("--sgbm-speckle-range", type=int, default=2)
+    parser.add_argument(
+        "--sgbm-mode", choices=("sgbm", "hh", "3way", "hh4"), default="3way"
+    )
+
+
 def opencv_bm_parameters(args) -> dict[str, int]:
     """Return the StereoBM configuration stored with an experiment artifact."""
     return {
@@ -123,6 +139,25 @@ def opencv_bm_parameters(args) -> dict[str, int]:
         "speckle_window_size": int(args.bm_speckle_window_size),
         "speckle_range": int(args.bm_speckle_range),
         "disp12_max_diff": int(args.bm_disp12_max_diff),
+    }
+
+
+def opencv_sgbm_parameters(args) -> dict[str, int | str]:
+    """Return the effective StereoSGBM configuration stored with an artifact."""
+    block_size = int(args.sgbm_block_size)
+    p1 = args.sgbm_p1
+    p2 = args.sgbm_p2
+    return {
+        "min_disparity": int(args.sgbm_min_disparity),
+        "num_disparities": int(args.sgbm_num_disparities),
+        "block_size": block_size,
+        "p1": int(p1) if p1 is not None else 8 * 3 * block_size * block_size,
+        "p2": int(p2) if p2 is not None else 32 * 3 * block_size * block_size,
+        "disp12_max_diff": int(args.sgbm_disp12_max_diff),
+        "uniqueness_ratio": int(args.sgbm_uniqueness_ratio),
+        "speckle_window_size": int(args.sgbm_speckle_window_size),
+        "speckle_range": int(args.sgbm_speckle_range),
+        "mode": args.sgbm_mode,
     }
 
 
@@ -136,11 +171,13 @@ def resolve_model_iters(backend: str, iters: int | None) -> int | None:
 
 
 def validate_backend_mode(args) -> None:
-    """Keep the classical BM baseline on its intended left-view route."""
-    if args.stereo_backend == "opencv_bm" and (
+    """Keep the classical OpenCV baselines on their intended left-view route."""
+    if args.stereo_backend in ("opencv_bm", "opencv_sgbm") and (
         args.output_view != "left" or args.bi != 0
     ):
-        raise ValueError("opencv_bm only supports --output-view left with --bi=0")
+        raise ValueError(
+            f"{args.stereo_backend} only supports --output-view left with --bi=0"
+        )
 
 
 def resolve_processing_end(
@@ -454,13 +491,14 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "opencv_bm"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "opencv_bm", "opencv_sgbm"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
     add_model_iteration_arguments(parser)
     add_opencv_bm_arguments(parser)
+    add_opencv_sgbm_arguments(parser)
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--hiera", type=str, default="auto", choices=["auto", "direct", "hiera"])
@@ -537,8 +575,8 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
     validate_backend_mode(args)
-    if backend == "opencv_bm" and args.model_type == "DAv2L-5":
-        args.model_type = "StereoBM"
+    if backend in ("opencv_bm", "opencv_sgbm") and args.model_type == "DAv2L-5":
+        args.model_type = "StereoBM" if backend == "opencv_bm" else "StereoSGBM"
     model_iters = resolve_model_iters(backend, args.iters)
 
     t_model_load = 0.0
@@ -587,6 +625,16 @@ def main() -> None:
         bm_speckle_window_size=args.bm_speckle_window_size,
         bm_speckle_range=args.bm_speckle_range,
         bm_disp12_max_diff=args.bm_disp12_max_diff,
+        sgbm_min_disparity=args.sgbm_min_disparity,
+        sgbm_num_disparities=args.sgbm_num_disparities,
+        sgbm_block_size=args.sgbm_block_size,
+        sgbm_p1=args.sgbm_p1,
+        sgbm_p2=args.sgbm_p2,
+        sgbm_disp12_max_diff=args.sgbm_disp12_max_diff,
+        sgbm_uniqueness_ratio=args.sgbm_uniqueness_ratio,
+        sgbm_speckle_window_size=args.sgbm_speckle_window_size,
+        sgbm_speckle_range=args.sgbm_speckle_range,
+        sgbm_mode=args.sgbm_mode,
     )
     t_model_load += time.perf_counter() - t0
     raft = None
@@ -907,6 +955,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "iters": model_iters,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
+        "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
         "n_frames": processed,
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
@@ -950,6 +999,7 @@ def main() -> None:
         "iters": model_iters,
         "bidirectional": bool(args.bi),
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
+        "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
         "max_disp": args.max_disp if backend in ("las2", "ffs") else None,
         "start_frame": args.start_frame,
         "end_frame": frame_idx,

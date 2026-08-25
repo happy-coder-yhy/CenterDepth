@@ -22,6 +22,9 @@ class DepthVideoTimingTests(unittest.TestCase):
         self.assertEqual(
             run_depth_video.timing_artifact_name("opencv_bm"), "opencv_bm_timing.json"
         )
+        self.assertEqual(
+            run_depth_video.timing_artifact_name("opencv_sgbm"), "opencv_sgbm_timing.json"
+        )
 
     def test_opencv_bm_needs_no_weights_and_exposes_classical_parameters(self):
         self.assertEqual(run_depth_video.resolve_weights_dir(None, "opencv_bm"), Path("."))
@@ -52,6 +55,35 @@ class DepthVideoTimingTests(unittest.TestCase):
                 SimpleNamespace(stereo_backend="opencv_bm", output_view="left", bi=1)
             )
 
+    def test_opencv_sgbm_needs_no_weights_and_exposes_native_parameters(self):
+        self.assertEqual(run_depth_video.resolve_weights_dir(None, "opencv_sgbm"), Path("."))
+        parser = argparse.ArgumentParser()
+        run_depth_video.add_opencv_sgbm_arguments(parser)
+
+        args = parser.parse_args([])
+
+        self.assertEqual(args.sgbm_min_disparity, 0)
+        self.assertEqual(args.sgbm_num_disparities, 128)
+        self.assertEqual(args.sgbm_block_size, 5)
+        self.assertIsNone(args.sgbm_p1)
+        self.assertIsNone(args.sgbm_p2)
+        self.assertEqual(args.sgbm_mode, "3way")
+
+    def test_opencv_sgbm_is_limited_to_left_single_direction_output(self):
+        valid = SimpleNamespace(
+            stereo_backend="opencv_sgbm", output_view="left", bi=0
+        )
+        run_depth_video.validate_backend_mode(valid)
+
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="opencv_sgbm", output_view="center", bi=0)
+            )
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="opencv_sgbm", output_view="left", bi=1)
+            )
+
     def test_opencv_bm_timing_metadata_records_reproducible_parameters(self):
         args = SimpleNamespace(
             bm_num_disparities=128,
@@ -71,6 +103,36 @@ class DepthVideoTimingTests(unittest.TestCase):
                 "speckle_window_size": 100,
                 "speckle_range": 2,
                 "disp12_max_diff": 1,
+            },
+        )
+
+    def test_opencv_sgbm_timing_metadata_records_reproducible_parameters(self):
+        args = SimpleNamespace(
+            sgbm_min_disparity=0,
+            sgbm_num_disparities=128,
+            sgbm_block_size=5,
+            sgbm_p1=None,
+            sgbm_p2=None,
+            sgbm_disp12_max_diff=1,
+            sgbm_uniqueness_ratio=10,
+            sgbm_speckle_window_size=100,
+            sgbm_speckle_range=2,
+            sgbm_mode="3way",
+        )
+
+        self.assertEqual(
+            run_depth_video.opencv_sgbm_parameters(args),
+            {
+                "min_disparity": 0,
+                "num_disparities": 128,
+                "block_size": 5,
+                "p1": 600,
+                "p2": 2400,
+                "disp12_max_diff": 1,
+                "uniqueness_ratio": 10,
+                "speckle_window_size": 100,
+                "speckle_range": 2,
+                "mode": "3way",
             },
         )
 
