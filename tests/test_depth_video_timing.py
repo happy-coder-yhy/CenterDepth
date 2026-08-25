@@ -19,6 +19,60 @@ class DepthVideoTimingTests(unittest.TestCase):
         self.assertEqual(run_depth_video.timing_artifact_name("waft"), "waft_timing.json")
         self.assertEqual(run_depth_video.timing_artifact_name("ffs"), "ffs_timing.json")
         self.assertEqual(run_depth_video.timing_artifact_name("las2"), "las2_timing.json")
+        self.assertEqual(
+            run_depth_video.timing_artifact_name("opencv_bm"), "opencv_bm_timing.json"
+        )
+
+    def test_opencv_bm_needs_no_weights_and_exposes_classical_parameters(self):
+        self.assertEqual(run_depth_video.resolve_weights_dir(None, "opencv_bm"), Path("."))
+        parser = argparse.ArgumentParser()
+        run_depth_video.add_opencv_bm_arguments(parser)
+
+        args = parser.parse_args([])
+
+        self.assertEqual(args.bm_num_disparities, 128)
+        self.assertEqual(args.bm_block_size, 15)
+        self.assertEqual(args.bm_uniqueness_ratio, 10)
+        self.assertEqual(args.bm_speckle_window_size, 100)
+        self.assertEqual(args.bm_speckle_range, 2)
+        self.assertEqual(args.bm_disp12_max_diff, 1)
+
+    def test_opencv_bm_is_limited_to_left_single_direction_output(self):
+        valid = SimpleNamespace(
+            stereo_backend="opencv_bm", output_view="left", bi=0
+        )
+        run_depth_video.validate_backend_mode(valid)
+
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="opencv_bm", output_view="center", bi=0)
+            )
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="opencv_bm", output_view="left", bi=1)
+            )
+
+    def test_opencv_bm_timing_metadata_records_reproducible_parameters(self):
+        args = SimpleNamespace(
+            bm_num_disparities=128,
+            bm_block_size=15,
+            bm_uniqueness_ratio=10,
+            bm_speckle_window_size=100,
+            bm_speckle_range=2,
+            bm_disp12_max_diff=1,
+        )
+
+        self.assertEqual(
+            run_depth_video.opencv_bm_parameters(args),
+            {
+                "num_disparities": 128,
+                "block_size": 15,
+                "uniqueness_ratio": 10,
+                "speckle_window_size": 100,
+                "speckle_range": 2,
+                "disp12_max_diff": 1,
+            },
+        )
 
     def test_temporal_initialization_accepts_only_bi_waft_direct_mode(self):
         valid = SimpleNamespace(

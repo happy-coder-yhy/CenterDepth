@@ -1,4 +1,4 @@
-"""立体匹配后端统一入口（s2m2 | waft | las2 | ffs）。
+"""立体匹配后端统一入口（s2m2 | waft | las2 | ffs | opencv_bm）。
 
 waft 相关模块按需惰性导入，避免 s2m2 路径依赖 peft/timm/yacs
 （服务器 allbase_env 可继续独立运行 s2m2）。
@@ -6,7 +6,7 @@ waft 相关模块按需惰性导入，避免 s2m2 路径依赖 peft/timm/yacs
 
 from __future__ import annotations
 
-BACKENDS = ("s2m2", "waft", "las2", "ffs")
+BACKENDS = ("s2m2", "waft", "las2", "ffs", "opencv_bm")
 
 
 def get_backend(name: str):
@@ -27,6 +27,10 @@ def get_backend(name: str):
         from . import ffs_inference
 
         return ffs_inference
+    if name == "opencv_bm":
+        from . import opencv_bm_inference
+
+        return opencv_bm_inference
     raise ValueError(f"未知立体匹配后端: {name}（可选: {', '.join(BACKENDS)}）")
 
 
@@ -61,6 +65,10 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             valid_iters=kwargs.get("valid_iters", 8),
             ffs_root=kwargs.get("ffs_root"),
         )
+    if backend == "opencv_bm":
+        from . import opencv_bm_inference
+
+        return opencv_bm_inference.load_opencv_bm(model_type, weights_dir, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")
 
 
@@ -84,6 +92,10 @@ def run(backend: str, model, left, right, device: str, **kwargs):
         from . import ffs_inference
 
         return ffs_inference.run_stereo_matching(model, left, right, device, **kwargs)
+    if backend == "opencv_bm":
+        from . import opencv_bm_inference
+
+        return opencv_bm_inference.run_stereo_matching(model, left, right, device, **kwargs)
     raise ValueError(f"未知立体匹配后端: {backend}")
 
 

@@ -51,6 +51,8 @@ from stereo_center.visualize import (  # noqa: E402
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
+    if backend == "opencv_bm":
+        return Path(".")
     if explicit:
         return Path(explicit)
     env_map = {
@@ -102,6 +104,28 @@ def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ffs-valid-iters", dest="iters", type=int, help=argparse.SUPPRESS)
 
 
+def add_opencv_bm_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add OpenCV StereoBM parameters in OpenCV's native units."""
+    parser.add_argument("--bm-num-disparities", type=int, default=128)
+    parser.add_argument("--bm-block-size", type=int, default=15)
+    parser.add_argument("--bm-uniqueness-ratio", type=int, default=10)
+    parser.add_argument("--bm-speckle-window-size", type=int, default=100)
+    parser.add_argument("--bm-speckle-range", type=int, default=2)
+    parser.add_argument("--bm-disp12-max-diff", type=int, default=1)
+
+
+def opencv_bm_parameters(args) -> dict[str, int]:
+    """Return the StereoBM configuration stored with an experiment artifact."""
+    return {
+        "num_disparities": int(args.bm_num_disparities),
+        "block_size": int(args.bm_block_size),
+        "uniqueness_ratio": int(args.bm_uniqueness_ratio),
+        "speckle_window_size": int(args.bm_speckle_window_size),
+        "speckle_range": int(args.bm_speckle_range),
+        "disp12_max_diff": int(args.bm_disp12_max_diff),
+    }
+
+
 def resolve_model_iters(backend: str, iters: int | None) -> int | None:
     """Resolve backend defaults while keeping the public CLI name as --iters."""
     if iters is not None:
@@ -109,6 +133,14 @@ def resolve_model_iters(backend: str, iters: int | None) -> int | None:
     if backend == "ffs":
         return 8
     return None
+
+
+def validate_backend_mode(args) -> None:
+    """Keep the classical BM baseline on its intended left-view route."""
+    if args.stereo_backend == "opencv_bm" and (
+        args.output_view != "left" or args.bi != 0
+    ):
+        raise ValueError("opencv_bm only supports --output-view left with --bi=0")
 
 
 def resolve_processing_end(
@@ -325,6 +357,12 @@ def process_batch(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
                 hiera=args.hiera,
+                bm_num_disparities=args.bm_num_disparities,
+                bm_block_size=args.bm_block_size,
+                bm_uniqueness_ratio=args.bm_uniqueness_ratio,
+                bm_speckle_window_size=args.bm_speckle_window_size,
+                bm_speckle_range=args.bm_speckle_range,
+                bm_disp12_max_diff=args.bm_disp12_max_diff,
             )
             timing["waft_forward"] += time.perf_counter() - t0
             dR = occR = confR = None
@@ -416,12 +454,13 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "opencv_bm"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
     add_model_iteration_arguments(parser)
+    add_opencv_bm_arguments(parser)
     parser.add_argument("--weights", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--hiera", type=str, default="auto", choices=["auto", "direct", "hiera"])
@@ -497,6 +536,9 @@ def main() -> None:
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     backend = args.stereo_backend
+    validate_backend_mode(args)
+    if backend == "opencv_bm" and args.model_type == "DAv2L-5":
+        args.model_type = "StereoBM"
     model_iters = resolve_model_iters(backend, args.iters)
 
     t_model_load = 0.0
@@ -539,6 +581,12 @@ def main() -> None:
         valid_iters=model_iters,
         hiera=args.hiera,
         iters=model_iters,
+        bm_num_disparities=args.bm_num_disparities,
+        bm_block_size=args.bm_block_size,
+        bm_uniqueness_ratio=args.bm_uniqueness_ratio,
+        bm_speckle_window_size=args.bm_speckle_window_size,
+        bm_speckle_range=args.bm_speckle_range,
+        bm_disp12_max_diff=args.bm_disp12_max_diff,
     )
     t_model_load += time.perf_counter() - t0
     raft = None
@@ -855,8 +903,10 @@ def main() -> None:
         "backend": backend,
         "model_type": args.model_type,
         "bidirectional": bool(args.bi),
+        "output_view": args.output_view,
         "batch_size": args.batch_size,
         "iters": model_iters,
+        "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "n_frames": processed,
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
@@ -899,6 +949,7 @@ def main() -> None:
         "model_type": args.model_type,
         "iters": model_iters,
         "bidirectional": bool(args.bi),
+        "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "max_disp": args.max_disp if backend in ("las2", "ffs") else None,
         "start_frame": args.start_frame,
         "end_frame": frame_idx,
@@ -972,7 +1023,8 @@ def main() -> None:
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
     backend_label = backend.upper()
-    print(f"[timing] {backend_label} 双向前向 {t_waft:.2f}s")
+    direction_label = "双向" if args.bi else "单向"
+    print(f"[timing] {backend_label} {direction_label}前向 {t_waft:.2f}s")
     print(f"[timing] {backend_label} 输入到输出管线 {stereo_total_s:.2f}s（细分见 {timing_filename}）")
     if args.waft_temporal_init:
         print(f"[timing] 时序双向光流 {waft_stage_seconds.get('temporal_flow', 0.0):.2f}s")
