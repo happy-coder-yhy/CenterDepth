@@ -220,18 +220,39 @@ def _install_inference_utils_compat() -> None:
     sys.modules["stereonet.utils"] = utils_module
 
 
+def _is_upstream_compat_module(name: str) -> bool:
+    return name == "stereonet" or name.startswith("stereonet.") or name == "pytorch_lightning" or name.startswith("pytorch_lightning.")
+
+
+@contextmanager
+def _upstream_import_transaction(source_root: Path) -> Iterator[None]:
+    """Temporarily expose upstream import dependencies without mutating process state."""
+    source_dir = source_root / "src"
+    saved_path = list(sys.path)
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_upstream_compat_module(name)
+    }
+    try:
+        loaded = sys.modules.get("stereonet")
+        if loaded is not None and not _module_is_from_source(loaded, source_dir):
+            for name in tuple(sys.modules):
+                if name == "stereonet" or name.startswith("stereonet."):
+                    del sys.modules[name]
+        sys.path.insert(0, str(source_dir))
+        _install_lightning_compat()
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if _is_upstream_compat_module(name) and name not in saved_modules:
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
+        sys.path[:] = saved_path
+
+
 def _import_upstream_model(source_root: Path):
     source_dir = source_root / "src"
-    loaded = sys.modules.get("stereonet")
-    if loaded is not None and not _module_is_from_source(loaded, source_dir):
-        for name in tuple(sys.modules):
-            if name == "stereonet" or name.startswith("stereonet."):
-                del sys.modules[name]
-    source_text = str(source_dir)
-    if source_text in sys.path:
-        sys.path.remove(source_text)
-    sys.path.insert(0, source_text)
-    _install_lightning_compat()
     try:
         return importlib.import_module("stereonet.model")
     except ModuleNotFoundError as error:
@@ -299,21 +320,26 @@ def load_stereonet(
     stereonet_root: str | Path | None = None,
 ) -> StereoNetModel:
     """Construct the pinned architecture and load its checkpoint strictly."""
-    del model_type
+    if model_type != "stereonet_sceneflow_rgb":
+        raise ValueError(
+            "unknown StereoNet model type: "
+            f"{model_type} (accepted: stereonet_sceneflow_rgb)"
+        )
     source_root = resolve_stereonet_root(stereonet_root)
     checkpoint = resolve_checkpoint(weights_dir)
     source_revision = validate_source_revision(source_root)
     verify_checkpoint_sha256(checkpoint)
-    upstream = _import_upstream_model(source_root)
-    model = upstream.StereoNet(
-        k_downsampling_layers=3,
-        k_refinement_layers=3,
-        candidate_disparities=256,
-        feature_extractor_filters=32,
-        cost_volumizer_filters=32,
-    )
-    with _checkpoint_safe_globals():
-        checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    with _upstream_import_transaction(source_root):
+        upstream = _import_upstream_model(source_root)
+        model = upstream.StereoNet(
+            k_downsampling_layers=3,
+            k_refinement_layers=3,
+            candidate_disparities=256,
+            feature_extractor_filters=32,
+            cost_volumizer_filters=32,
+        )
+        with _checkpoint_safe_globals():
+            checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
     state_dict = checkpoint_data["state_dict"] if "state_dict" in checkpoint_data else checkpoint_data
     model.load_state_dict(normalize_state_dict_keys(state_dict), strict=True)
     model.eval().to(device)
@@ -354,6 +380,7 @@ def run_stereo_matching(
     """Run the actual StereoNet stages and recover source-grid disparity."""
     source_hw = tuple(left.shape[-2:])
     timing: dict[str, float] = {}
+    _synchronize(device)
     total_started = time.perf_counter()
     with _measure(timing, "input_resize_normalize_seconds", device):
         prepared_left, prepared_right, scale_x = prepare_inputs(left, right, wrapper.max_side)

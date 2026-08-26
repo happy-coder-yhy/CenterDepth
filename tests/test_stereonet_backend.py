@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -180,6 +181,73 @@ class StereoNetBackendTests(unittest.TestCase):
             stereo_backend.run_bi("stereonet", None, None, None, "cpu")
         with self.assertRaises(ValueError):
             stereo_backend.run_bi_batch("stereonet", None, None, None, "cpu")
+
+    def test_load_rejects_unknown_model_type(self):
+        with self.assertRaisesRegex(ValueError, "stereonet_sceneflow_rgb"):
+            stereonet_inference.load_stereonet("wrong", "weights/stereonet", "cpu")
+
+    def test_load_restores_foreign_modules_after_compatibility_import(self):
+        saved_modules = {
+            name: sys.modules.get(name)
+            for name in (
+                "stereonet",
+                "pytorch_lightning",
+                "pytorch_lightning.callbacks",
+                "pytorch_lightning.callbacks.model_checkpoint",
+            )
+        }
+        foreign_stereonet = types.ModuleType("stereonet")
+        foreign_stereonet.__file__ = "/tmp/foreign-stereonet/__init__.py"
+        sys.modules["stereonet"] = foreign_stereonet
+        for name in tuple(saved_modules):
+            if name != "stereonet":
+                sys.modules.pop(name, None)
+        try:
+            wrapper = stereonet_inference.load_stereonet(
+                "stereonet_sceneflow_rgb", "weights/stereonet", "cpu"
+            )
+            self.assertIs(sys.modules["stereonet"], foreign_stereonet)
+            self.assertNotIn("pytorch_lightning", sys.modules)
+            self.assertEqual(
+                wrapper.source_revision, stereonet_inference.PINNED_SOURCE_REVISION
+            )
+        finally:
+            for name, module in saved_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+
+    def test_total_timing_synchronizes_before_start_and_elapsed_read(self):
+        wrapper = stereonet_inference.StereoNetModel(
+            model=_FakeStereoNet(),
+            checkpoint=Path("checkpoint.ckpt"),
+            source_root=Path("source"),
+            source_revision=stereonet_inference.PINNED_SOURCE_REVISION,
+            max_side=16,
+            soft_argmin=_fake_soft_argmin,
+        )
+        events: list[str] = []
+
+        def synchronize(_: str) -> None:
+            events.append("sync")
+
+        def clock() -> float:
+            events.append("clock")
+            return float(len(events))
+
+        with patch.object(stereonet_inference, "_synchronize", synchronize), patch.object(
+            stereonet_inference.time, "perf_counter", clock
+        ):
+            stereonet_inference.run_stereo_matching(
+                wrapper,
+                torch.full((1, 3, 8, 16), 255.0),
+                torch.full((1, 3, 8, 16), 255.0),
+                device="cpu",
+            )
+
+        self.assertEqual(events[:2], ["sync", "clock"])
+        self.assertEqual(events[-2:], ["sync", "clock"])
 
 
 if __name__ == "__main__":
