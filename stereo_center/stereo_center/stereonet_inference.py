@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import os
 import subprocess
 import sys
 import time
 import types
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,8 @@ from torch import nn
 
 
 CHECKPOINT_NAME = "epoch=20-step=744533.ckpt"
+PINNED_SOURCE_REVISION = "9c0260f270547d8001e9d637cf3a94658f805bae"
+CHECKPOINT_SHA256 = "03b67d8571f39505959cf485de272fe0ea615a1d8dd3fab16f06af4acec2b82e"
 DEFAULT_MAX_SIDE = 625
 STRIDE = 8
 
@@ -250,6 +253,32 @@ def _source_revision(source_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def validate_source_revision(source_root: Path) -> str:
+    """Require the exact upstream revision recorded for this adapter."""
+    revision = _source_revision(source_root)
+    if revision != PINNED_SOURCE_REVISION:
+        raise RuntimeError(
+            "StereoNet source revision mismatch: "
+            f"expected {PINNED_SOURCE_REVISION}, got {revision}"
+        )
+    return revision
+
+
+def verify_checkpoint_sha256(checkpoint: Path) -> str:
+    """Verify the downloaded checkpoint before any deserialization occurs."""
+    digest = hashlib.sha256()
+    with checkpoint.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != CHECKPOINT_SHA256:
+        raise RuntimeError(
+            "StereoNet checkpoint SHA-256 mismatch: "
+            f"expected {CHECKPOINT_SHA256}, got {actual}"
+        )
+    return actual
+
+
 @dataclass
 class StereoNetModel:
     model: nn.Module
@@ -257,6 +286,7 @@ class StereoNetModel:
     source_root: Path
     source_revision: str
     max_side: int
+    soft_argmin: Callable[[torch.Tensor, int], torch.Tensor]
     timing: dict[str, float] = field(default_factory=dict)
 
 
@@ -272,6 +302,8 @@ def load_stereonet(
     del model_type
     source_root = resolve_stereonet_root(stereonet_root)
     checkpoint = resolve_checkpoint(weights_dir)
+    source_revision = validate_source_revision(source_root)
+    verify_checkpoint_sha256(checkpoint)
     upstream = _import_upstream_model(source_root)
     model = upstream.StereoNet(
         k_downsampling_layers=3,
@@ -289,8 +321,9 @@ def load_stereonet(
         model=model,
         checkpoint=checkpoint,
         source_root=source_root,
-        source_revision=_source_revision(source_root),
+        source_revision=source_revision,
         max_side=max_side,
+        soft_argmin=upstream.soft_argmin,
     )
 
 
@@ -315,6 +348,7 @@ def run_stereo_matching(
     left: torch.Tensor,
     right: torch.Tensor,
     device: str = "cpu",
+    timing_out: dict[str, float] | None = None,
     **_: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Run the actual StereoNet stages and recover source-grid disparity."""
@@ -341,9 +375,7 @@ def run_stereo_matching(
         with _measure(timing, "cost_volume_seconds", device):
             cost = upstream.cost_volumizer((left_embedding, right_embedding), side="left")
         with _measure(timing, "coarse_regression_seconds", device):
-            disparity = upstream.__class__.__module__
-            model_module = importlib.import_module(disparity)
-            coarse = model_module.soft_argmin(cost, upstream.candidate_disparities)
+            coarse = wrapper.soft_argmin(cost, upstream.candidate_disparities)
         disparity = coarse
         for index, refiner in enumerate(upstream.refiners, start=1):
             with _measure(timing, f"refinement_{index}_seconds", device):
@@ -362,10 +394,17 @@ def run_stereo_matching(
         disparity = restore_disparity(disparity, source_hw, scale_x)
         output = disparity.float().cpu()
         horizontal = torch.arange(source_hw[1], dtype=output.dtype).view(1, 1, -1)
-        visibility = ((output >= 0.5) & (horizontal - output >= 0)).float()
+        visibility = (
+            (output >= 0.5)
+            & (horizontal - output >= 0)
+            & (output < source_hw[1] - 1)
+        ).float()
         confidence = torch.ones_like(output)
     _synchronize(device)
     elapsed = time.perf_counter() - total_started
     timing["stereo_total_seconds"] = elapsed
+    timing["model_forward_seconds"] = timing["stereo_forward_seconds"]
     wrapper.timing = timing
+    if timing_out is not None:
+        timing_out.update(timing)
     return output, visibility, confidence, elapsed

@@ -2,8 +2,10 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
+from torch import nn
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1] / "stereo_center"
@@ -12,6 +14,38 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from stereo_center import stereo_backend
 from stereo_center import stereonet_inference
+
+
+def _fake_soft_argmin(cost: torch.Tensor, _: int) -> torch.Tensor:
+    return cost
+
+
+class _FakeFeatureExtractor(nn.Module):
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return image
+
+
+class _FakeCostVolumizer(nn.Module):
+    def forward(self, inputs, side: str = "left") -> torch.Tensor:
+        del side
+        batch, _, height, width = inputs[0].shape
+        return torch.full((batch, 1, height, width), width - 1.0)
+
+
+class _FakeRefiner(nn.Module):
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(inputs[:, -1:], 15.0) - inputs[:, -1:]
+
+
+class _FakeStereoNet(nn.Module):
+    candidate_disparities = 256
+    k_refinement_layers = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.feature_extractor = _FakeFeatureExtractor()
+        self.cost_volumizer = _FakeCostVolumizer()
+        self.refiners = nn.ModuleList([_FakeRefiner() for _ in range(3)])
 
 
 class StereoNetBackendTests(unittest.TestCase):
@@ -83,6 +117,69 @@ class StereoNetBackendTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(prepared_right).all())
         self.assertTrue(torch.equal(prepared_left, torch.full_like(prepared_left, -1.0)))
         self.assertTrue(torch.equal(prepared_right, torch.full_like(prepared_right, 1.0)))
+
+    def test_source_revision_validation_requires_the_pinned_revision(self):
+        with patch.object(
+            stereonet_inference,
+            "_source_revision",
+            return_value=stereonet_inference.PINNED_SOURCE_REVISION,
+        ):
+            self.assertEqual(
+                stereonet_inference.validate_source_revision(Path("source")),
+                stereonet_inference.PINNED_SOURCE_REVISION,
+            )
+        with patch.object(stereonet_inference, "_source_revision", return_value="wrong"):
+            with self.assertRaisesRegex(RuntimeError, "source revision mismatch"):
+                stereonet_inference.validate_source_revision(Path("source"))
+
+    def test_checkpoint_sha256_validation_rejects_mismatch(self):
+        contents = b"test checkpoint"
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "checkpoint.ckpt"
+            checkpoint.write_bytes(contents)
+            expected = "f908001a4b96aac17dfcc9519072c6282ad28800926524bc5178523070356e32"
+            with patch.object(stereonet_inference, "CHECKPOINT_SHA256", expected):
+                self.assertEqual(
+                    stereonet_inference.verify_checkpoint_sha256(checkpoint), expected
+                )
+            with patch.object(stereonet_inference, "CHECKPOINT_SHA256", "0" * 64):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint SHA-256 mismatch"):
+                    stereonet_inference.verify_checkpoint_sha256(checkpoint)
+
+    def test_run_returns_batched_visibility_confidence_and_timing(self):
+        wrapper = stereonet_inference.StereoNetModel(
+            model=_FakeStereoNet(),
+            checkpoint=Path("checkpoint.ckpt"),
+            source_root=Path("source"),
+            source_revision=stereonet_inference.PINNED_SOURCE_REVISION,
+            max_side=16,
+            soft_argmin=_fake_soft_argmin,
+        )
+        left = torch.full((2, 3, 8, 16), 255.0)
+        right = torch.full((2, 3, 8, 16), 255.0)
+        timing_out = {"existing": 1.0}
+
+        disparity, visibility, confidence, elapsed = stereonet_inference.run_stereo_matching(
+            wrapper, left, right, device="cpu", timing_out=timing_out
+        )
+
+        self.assertEqual(tuple(disparity.shape), (2, 8, 16))
+        self.assertTrue(torch.allclose(disparity, torch.full_like(disparity, 15.0)))
+        self.assertTrue(torch.equal(visibility, torch.zeros_like(visibility)))
+        self.assertTrue(torch.equal(confidence, torch.ones_like(confidence)))
+        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertEqual(timing_out["existing"], 1.0)
+        self.assertEqual(timing_out, wrapper.timing | {"existing": 1.0})
+        self.assertIn("stereo_forward_seconds", timing_out)
+        self.assertEqual(
+            timing_out["model_forward_seconds"], timing_out["stereo_forward_seconds"]
+        )
+
+    def test_stereonet_remains_unsupported_by_bidirectional_dispatchers(self):
+        with self.assertRaises(ValueError):
+            stereo_backend.run_bi("stereonet", None, None, None, "cpu")
+        with self.assertRaises(ValueError):
+            stereo_backend.run_bi_batch("stereonet", None, None, None, "cpu")
 
 
 if __name__ == "__main__":
