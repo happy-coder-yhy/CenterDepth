@@ -6,7 +6,7 @@ waft 相关模块按需惰性导入，避免 s2m2 路径依赖 peft/timm/yacs
 
 from __future__ import annotations
 
-BACKENDS = ("s2m2", "waft", "las2", "ffs", "opencv_bm", "opencv_sgbm")
+BACKENDS = ("s2m2", "waft", "las2", "ffs", "stereonet", "opencv_bm", "opencv_sgbm")
 
 
 def get_backend(name: str):
@@ -27,6 +27,10 @@ def get_backend(name: str):
         from . import ffs_inference
 
         return ffs_inference
+    if name == "stereonet":
+        from . import stereonet_inference
+
+        return stereonet_inference
     if name == "opencv_bm":
         from . import opencv_bm_inference
 
@@ -69,6 +73,16 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             valid_iters=kwargs.get("valid_iters", 8),
             ffs_root=kwargs.get("ffs_root"),
         )
+    if backend == "stereonet":
+        from . import stereonet_inference
+
+        return stereonet_inference.load_stereonet(
+            model_type,
+            weights_dir,
+            device,
+            max_side=kwargs.get("max_side", 625),
+            stereonet_root=kwargs.get("stereonet_root"),
+        )
     if backend == "opencv_bm":
         from . import opencv_bm_inference
 
@@ -102,6 +116,10 @@ def run(backend: str, model, left, right, device: str, **kwargs):
         from . import ffs_inference
 
         return ffs_inference.run_stereo_matching(model, left, right, device, **kwargs)
+    if backend == "stereonet":
+        from . import stereonet_inference
+
+        return stereonet_inference.run_stereo_matching(model, left, right, device, **kwargs)
     if backend == "opencv_bm":
         from . import opencv_bm_inference
 
