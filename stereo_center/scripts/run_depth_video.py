@@ -56,6 +56,8 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
         return Path(".")
     if explicit:
         return Path(explicit)
+    if backend == "stereonet":
+        return PROJECT_ROOT.parent / "weights" / "stereonet"
     env_map = {
         "waft": "WAFT_WEIGHTS_DIR",
         "s2m2": "S2M2_WEIGHTS_DIR",
@@ -103,6 +105,18 @@ def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--waft-iters", dest="iters", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--ffs-valid-iters", dest="iters", type=int, help=argparse.SUPPRESS)
+
+
+def add_stereonet_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add pinned StereoNet source and resize controls."""
+    parser.add_argument(
+        "--stereonet-root", type=str, default=None,
+        help="StereoNet_PyTorch 固定源码根目录（默认 third_party/StereoNet_PyTorch）",
+    )
+    parser.add_argument(
+        "--stereonet-max-side", type=int, default=625,
+        help="StereoNet 输入最长边（Scene Flow RGB 权重默认 625）",
+    )
 
 
 def add_opencv_bm_arguments(parser: argparse.ArgumentParser) -> None:
@@ -197,8 +211,8 @@ def resolve_model_iters(backend: str, iters: int | None) -> int | None:
 
 
 def validate_backend_mode(args) -> None:
-    """Keep the classical OpenCV baselines on their intended left-view route."""
-    if args.stereo_backend in ("opencv_bm", "opencv_sgbm") and (
+    """Keep one-way baselines on their intended left-view route."""
+    if args.stereo_backend in ("opencv_bm", "opencv_sgbm", "stereonet") and (
         args.output_view != "left" or args.bi != 0
     ):
         raise ValueError(
@@ -369,9 +383,9 @@ def process_batch(
         rgb_b: (B, 3, H, W) float32 GPU RGB（0-255）。
     """
     timing = {
-        "waft_forward": 0.0,
-        "waft_total": 0.0,
-        "waft_detail": None,
+        "stereo_forward": 0.0,
+        "stereo_total": 0.0,
+        "stereo_detail": None,
         "photo_align": 0.0,
         "center_fusion": 0.0,
         "fill": 0.0,
@@ -397,9 +411,9 @@ def process_batch(
                 timing_out=waft_detail,
                 **waft_temporal_kwargs(args, temporal_flow_model, temporal_state),
             )
-            timing["waft_forward"] += waft_detail.get("model_forward_seconds", 0.0)
-            timing["waft_total"] += waft_detail.get("waft_total_seconds", 0.0)
-            timing["waft_detail"] = waft_detail
+            timing["stereo_forward"] += waft_detail.get("model_forward_seconds", 0.0)
+            timing["stereo_total"] += waft_detail.get("waft_total_seconds", 0.0)
+            timing["stereo_detail"] = waft_detail
         else:
             waft_detail = {}
             dL, occL, confL, _ = waft_inference.run_stereo_matching_batch(
@@ -407,9 +421,9 @@ def process_batch(
                 hiera=args.hiera, conf_mode="ones", occ_mode="visibility",
                 timing_out=waft_detail,
             )
-            timing["waft_forward"] += waft_detail.get("model_forward_seconds", 0.0)
-            timing["waft_total"] += waft_detail.get("waft_total_seconds", 0.0)
-            timing["waft_detail"] = waft_detail
+            timing["stereo_forward"] += waft_detail.get("model_forward_seconds", 0.0)
+            timing["stereo_total"] += waft_detail.get("waft_total_seconds", 0.0)
+            timing["stereo_detail"] = waft_detail
             dR = occR = confR = None
     else:
         if args.bi:
@@ -419,13 +433,19 @@ def process_batch(
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
                 hiera=args.hiera,
             )
-            timing["waft_forward"] += time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
+            timing["stereo_forward"] += elapsed
+            timing["stereo_total"] += elapsed
         else:
             t0 = time.perf_counter()
-            dL, occL, confL, _ = stereo_backend.run(
+            stereo_detail = {}
+            dL, occL, confL, elapsed = stereo_backend.run(
                 args.stereo_backend, model, left_t, right_t, args.device,
                 max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
                 hiera=args.hiera,
+                max_side=args.stereonet_max_side,
+                stereonet_root=args.stereonet_root,
+                timing_out=stereo_detail,
                 bm_num_disparities=args.bm_num_disparities,
                 bm_block_size=args.bm_block_size,
                 bm_uniqueness_ratio=args.bm_uniqueness_ratio,
@@ -433,7 +453,17 @@ def process_batch(
                 bm_speckle_range=args.bm_speckle_range,
                 bm_disp12_max_diff=args.bm_disp12_max_diff,
             )
-            timing["waft_forward"] += time.perf_counter() - t0
+            measured = time.perf_counter() - t0
+            timing["stereo_forward"] += stereo_detail.get(
+                "model_forward_seconds", elapsed
+            )
+            timing["stereo_total"] += stereo_detail.get(
+                "stereo_total_seconds", measured
+            )
+            timing["stereo_detail"] = stereo_detail or {
+                "stereo_forward_seconds": elapsed,
+                "stereo_total_seconds": measured,
+            }
             dR = occR = confR = None
     if args.guided_filter:
         from stereo_center.guided_filter import guided_filter_batch  # noqa: E402
@@ -523,11 +553,12 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理 N 帧（调试用）")
     parser.add_argument("--fps", type=float, default=0.0, help="输出视频 fps（默认取源视频）")
     parser.add_argument("--outdir", type=str, default=str(PROJECT_ROOT / "outputs/depth_video"))
-    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "opencv_bm", "opencv_sgbm"])
+    parser.add_argument("--stereo-backend", type=str, default="waft", choices=["waft", "s2m2", "las2", "ffs", "stereonet", "opencv_bm", "opencv_sgbm"])
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
+    add_stereonet_arguments(parser)
     add_model_iteration_arguments(parser)
     add_opencv_bm_arguments(parser)
     add_opencv_sgbm_arguments(parser)
@@ -611,6 +642,8 @@ def main() -> None:
     validate_left_hole_fill_mode(args)
     if backend in ("opencv_bm", "opencv_sgbm") and args.model_type == "DAv2L-5":
         args.model_type = "StereoBM" if backend == "opencv_bm" else "StereoSGBM"
+    elif backend == "stereonet" and args.model_type == "DAv2L-5":
+        args.model_type = "stereonet_sceneflow_rgb"
     model_iters = resolve_model_iters(backend, args.iters)
 
     t_model_load = 0.0
@@ -653,6 +686,8 @@ def main() -> None:
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
         ffs_root=args.ffs_root,
+        stereonet_root=args.stereonet_root,
+        max_side=args.stereonet_max_side,
         valid_iters=model_iters,
         hiera=args.hiera,
         iters=model_iters,
@@ -674,6 +709,13 @@ def main() -> None:
         sgbm_mode=args.sgbm_mode,
     )
     t_model_load += time.perf_counter() - t0
+    stereonet_metadata = None
+    if backend == "stereonet":
+        stereonet_metadata = {
+            "max_side": int(args.stereonet_max_side),
+            "checkpoint": model.checkpoint.name,
+            "source_revision": model.source_revision,
+        }
     raft = None
     if args.temporal_raft or args.waft_temporal_init:
         raft_weights = (
@@ -829,12 +871,12 @@ def main() -> None:
             temporal_flow_model=raft if args.waft_temporal_init else None,
             temporal_state=temporal_state,
         )
-        t_waft += timing["waft_forward"]
+        t_waft += timing["stereo_forward"]
         t_align += timing["photo_align"]
         t_fusion += timing["center_fusion"]
         t_fill += timing["fill"]
         t_depth_gf += timing["depth_gf"]
-        timing_detail = timing.get("waft_detail")
+        timing_detail = timing.get("stereo_detail")
         if timing_detail is not None:
             stages_seconds = {
                     key: round(float(value), 6)
@@ -843,7 +885,7 @@ def main() -> None:
                 }
         else:
             stages_seconds = {
-                "stereo_forward_seconds": round(float(timing["waft_forward"]), 6)
+                "stereo_forward_seconds": round(float(timing["stereo_forward"]), 6)
             }
         timing_record = {
             "batch_index": len(waft_timing_records),
@@ -983,8 +1025,10 @@ def main() -> None:
         for key, value in record["stages_seconds"].items():
             waft_stage_seconds[key] = waft_stage_seconds.get(key, 0.0) + value
     stereo_total_s = waft_stage_seconds.get(
-        "waft_total_seconds",
-        waft_stage_seconds.get("stereo_forward_seconds", 0.0),
+        "stereo_total_seconds",
+        waft_stage_seconds.get(
+            "waft_total_seconds", waft_stage_seconds.get("stereo_forward_seconds", 0.0)
+        ),
     )
     stereo_model_s = waft_stage_seconds.get(
         "model_forward_seconds",
@@ -1004,6 +1048,7 @@ def main() -> None:
         "output_view": args.output_view,
         "batch_size": args.batch_size,
         "iters": model_iters,
+        "stereonet": stereonet_metadata,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
         "left_hole_fill": {
@@ -1053,6 +1098,7 @@ def main() -> None:
         "stereo_backend": backend,
         "model_type": args.model_type,
         "iters": model_iters,
+        "stereonet": stereonet_metadata,
         "bidirectional": bool(args.bi),
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,

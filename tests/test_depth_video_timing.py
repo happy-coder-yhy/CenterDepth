@@ -25,6 +25,36 @@ class DepthVideoTimingTests(unittest.TestCase):
         self.assertEqual(
             run_depth_video.timing_artifact_name("opencv_sgbm"), "opencv_sgbm_timing.json"
         )
+        self.assertEqual(
+            run_depth_video.timing_artifact_name("stereonet"), "stereonet_timing.json"
+        )
+
+    def test_stereonet_is_limited_to_left_single_direction_output(self):
+        valid = SimpleNamespace(
+            stereo_backend="stereonet", output_view="left", bi=0
+        )
+        run_depth_video.validate_backend_mode(valid)
+
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="stereonet", output_view="center", bi=0)
+            )
+        with self.assertRaisesRegex(ValueError, "left.*bi=0"):
+            run_depth_video.validate_backend_mode(
+                SimpleNamespace(stereo_backend="stereonet", output_view="left", bi=1)
+            )
+
+    def test_stereonet_cli_defaults_and_weights_resolution(self):
+        parser = argparse.ArgumentParser()
+        run_depth_video.add_stereonet_arguments(parser)
+        args = parser.parse_args([])
+
+        self.assertIsNone(args.stereonet_root)
+        self.assertEqual(args.stereonet_max_side, 625)
+        self.assertEqual(
+            run_depth_video.resolve_weights_dir(None, "stereonet"),
+            run_depth_video.PROJECT_ROOT.parent / "weights" / "stereonet",
+        )
 
     def test_opencv_bm_needs_no_weights_and_exposes_classical_parameters(self):
         self.assertEqual(run_depth_video.resolve_weights_dir(None, "opencv_bm"), Path("."))
