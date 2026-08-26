@@ -34,7 +34,7 @@ class DepthVideoTimingTests(unittest.TestCase):
         args = parser.parse_args([])
 
         self.assertEqual(args.bm_num_disparities, 128)
-        self.assertEqual(args.bm_block_size, 15)
+        self.assertEqual(args.bm_block_size, 31)
         self.assertEqual(args.bm_uniqueness_ratio, 10)
         self.assertEqual(args.bm_speckle_window_size, 100)
         self.assertEqual(args.bm_speckle_range, 2)
@@ -87,7 +87,7 @@ class DepthVideoTimingTests(unittest.TestCase):
     def test_opencv_bm_timing_metadata_records_reproducible_parameters(self):
         args = SimpleNamespace(
             bm_num_disparities=128,
-            bm_block_size=15,
+            bm_block_size=31,
             bm_uniqueness_ratio=10,
             bm_speckle_window_size=100,
             bm_speckle_range=2,
@@ -98,7 +98,7 @@ class DepthVideoTimingTests(unittest.TestCase):
             run_depth_video.opencv_bm_parameters(args),
             {
                 "num_disparities": 128,
-                "block_size": 15,
+                "block_size": 31,
                 "uniqueness_ratio": 10,
                 "speckle_window_size": 100,
                 "speckle_range": 2,

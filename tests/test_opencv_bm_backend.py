@@ -26,7 +26,7 @@ class OpenCVBMBackendTests(unittest.TestCase):
         model = stereo_backend.load("opencv_bm", "ignored", "", "cpu")
 
         self.assertEqual(model.num_disparities, 128)
-        self.assertEqual(model.block_size, 15)
+        self.assertEqual(model.block_size, 31)
         self.assertEqual(model.uniqueness_ratio, 10)
 
     def test_load_rejects_invalid_bm_parameters(self):

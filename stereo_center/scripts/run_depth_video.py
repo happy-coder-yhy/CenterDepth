@@ -108,7 +108,7 @@ def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
 def add_opencv_bm_arguments(parser: argparse.ArgumentParser) -> None:
     """Add OpenCV StereoBM parameters in OpenCV's native units."""
     parser.add_argument("--bm-num-disparities", type=int, default=128)
-    parser.add_argument("--bm-block-size", type=int, default=15)
+    parser.add_argument("--bm-block-size", type=int, default=31)
     parser.add_argument("--bm-uniqueness-ratio", type=int, default=10)
     parser.add_argument("--bm-speckle-window-size", type=int, default=100)
     parser.add_argument("--bm-speckle-range", type=int, default=2)

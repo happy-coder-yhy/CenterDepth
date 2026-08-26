@@ -13,7 +13,7 @@ import torch
 @dataclass(frozen=True)
 class OpenCVBMModel:
     num_disparities: int = 128
-    block_size: int = 15
+    block_size: int = 31
     uniqueness_ratio: int = 10
     speckle_window_size: int = 100
     speckle_range: int = 2
@@ -40,7 +40,7 @@ def load_opencv_bm(
     """Create a parameter-only StereoBM model; no checkpoint or GPU is used."""
     model = OpenCVBMModel(
         num_disparities=int(kwargs.get("bm_num_disparities", 128)),
-        block_size=int(kwargs.get("bm_block_size", 15)),
+        block_size=int(kwargs.get("bm_block_size", 31)),
         uniqueness_ratio=int(kwargs.get("bm_uniqueness_ratio", 10)),
         speckle_window_size=int(kwargs.get("bm_speckle_window_size", 100)),
         speckle_range=int(kwargs.get("bm_speckle_range", 2)),
