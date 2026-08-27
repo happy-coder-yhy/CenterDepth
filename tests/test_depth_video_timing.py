@@ -16,7 +16,7 @@ spec.loader.exec_module(run_depth_video)
 
 
 class DepthVideoTimingTests(unittest.TestCase):
-    def test_gpu_peak_memory_records_reserved_cuda_memory_in_mib(self):
+    def test_gpu_peak_memory_records_reserved_cuda_memory_in_gib(self):
         with (
             patch.object(run_depth_video.torch.cuda, "is_available", return_value=True),
             patch.object(run_depth_video.torch.cuda, "synchronize") as synchronize,
@@ -28,20 +28,20 @@ class DepthVideoTimingTests(unittest.TestCase):
             ),
         ):
             enabled = run_depth_video.reset_gpu_peak_memory("cuda:0")
-            peak_mib = run_depth_video.gpu_peak_memory_mib("cuda:0", enabled)
+            peak_gib = run_depth_video.gpu_peak_memory_gib("cuda:0", enabled)
 
         self.assertTrue(enabled)
-        self.assertEqual(peak_mib, 1536.0)
+        self.assertEqual(peak_gib, 1.5)
         self.assertEqual(synchronize.call_count, 2)
         reset.assert_called_once_with("cuda:0")
 
     def test_gpu_peak_memory_is_null_for_cpu_runs(self):
         with patch.object(run_depth_video.torch.cuda, "is_available") as available:
             enabled = run_depth_video.reset_gpu_peak_memory("cpu")
-            peak_mib = run_depth_video.gpu_peak_memory_mib("cpu", enabled)
+            peak_gib = run_depth_video.gpu_peak_memory_gib("cpu", enabled)
 
         self.assertFalse(enabled)
-        self.assertIsNone(peak_mib)
+        self.assertIsNone(peak_gib)
         available.assert_not_called()
 
     def test_timing_artifact_name_uses_backend(self):

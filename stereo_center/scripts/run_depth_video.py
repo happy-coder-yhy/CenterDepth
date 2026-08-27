@@ -105,12 +105,12 @@ def reset_gpu_peak_memory(device: str) -> bool:
     return True
 
 
-def gpu_peak_memory_mib(device: str, enabled: bool) -> float | None:
-    """Return the measured CUDA allocator peak in MiB, if tracking is enabled."""
+def gpu_peak_memory_gib(device: str, enabled: bool) -> float | None:
+    """Return the measured CUDA allocator peak in GiB, if tracking is enabled."""
     if not enabled:
         return None
     torch.cuda.synchronize(device)
-    return round(torch.cuda.max_memory_reserved(device) / (1024 ** 2), 2)
+    return round(torch.cuda.max_memory_reserved(device) / (1024 ** 3), 2)
 
 
 def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1059,7 +1059,7 @@ def main() -> None:
         + t_depth_gf + t_color + t_write
     )
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
-    peak_gpu_memory_mib = gpu_peak_memory_mib(args.device, gpu_memory_tracking)
+    peak_gpu_memory_gib = gpu_peak_memory_gib(args.device, gpu_memory_tracking)
     peak_gpu_memory_source = (
         "torch.cuda.max_memory_reserved" if gpu_memory_tracking else None
     )
@@ -1072,7 +1072,7 @@ def main() -> None:
         "output_view": args.output_view,
         "batch_size": args.batch_size,
         "iters": model_iters,
-        "peak_gpu_memory_mib": peak_gpu_memory_mib,
+        "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
@@ -1124,7 +1124,7 @@ def main() -> None:
         "stereo_backend": backend,
         "model_type": args.model_type,
         "iters": model_iters,
-        "peak_gpu_memory_mib": peak_gpu_memory_mib,
+        "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,
         "bidirectional": bool(args.bi),
