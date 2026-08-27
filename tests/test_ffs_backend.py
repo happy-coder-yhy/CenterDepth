@@ -61,6 +61,29 @@ class FFSBackendTests(unittest.TestCase):
         self.assertEqual(tuple(conf.shape), (2, 4, 5))
         self.assertEqual(elapsed, 0.25)
 
+    def test_forward_passes_requested_triton_volume_backend(self):
+        class Model:
+            def __init__(self):
+                self.kwargs = None
+
+            def forward(self, _left, _right, **kwargs):
+                self.kwargs = kwargs
+                return torch.ones(1, 2, 3)
+
+        model = Model()
+
+        disparity = ffs_inference._forward(
+            model,
+            torch.zeros(1, 3, 2, 3),
+            torch.zeros(1, 3, 2, 3),
+            valid_iters=5,
+            low_memory=False,
+            volume_backend="triton",
+        )
+
+        self.assertEqual(tuple(disparity.shape), (1, 2, 3))
+        self.assertEqual(model.kwargs["optimize_build_volume"], "triton")
+
 
 if __name__ == "__main__":
     unittest.main()

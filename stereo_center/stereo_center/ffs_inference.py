@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # stereo_center/
 DEFAULT_CKPT_NAME = "model_best_bp2_serialize.pth"
+VOLUME_BACKENDS = ("pytorch1", "triton")
 
 
 @dataclass
@@ -31,6 +32,7 @@ class FFSModel:
     model: torch.nn.Module
     max_disp: int
     valid_iters: int
+    volume_backend: str = "pytorch1"
 
 
 def resolve_checkpoint(weights: str | Path) -> Path:
@@ -109,8 +111,14 @@ def load_ffs(
     max_disp: int = 416,
     valid_iters: int = 8,
     ffs_root: str | Path | None = None,
+    volume_backend: str = "pytorch1",
 ) -> FFSModel:
     """Load a serialized Fast Foundation Stereo model checkpoint."""
+    if volume_backend not in VOLUME_BACKENDS:
+        raise ValueError(
+            f"Unsupported FFS volume backend: {volume_backend} "
+            f"(accepted: {', '.join(VOLUME_BACKENDS)})"
+        )
     resolve_ffs_root(ffs_root)
     ckpt_path = resolve_checkpoint(weights_dir)
     model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -125,9 +133,15 @@ def load_ffs(
     model.eval().to(device)
     print(
         f"[ffs] Fast Foundation Stereo loaded: {ckpt_path} "
-        f"(model_type={model_type}, max_disp={max_disp}, valid_iters={valid_iters})"
+        f"(model_type={model_type}, max_disp={max_disp}, valid_iters={valid_iters}, "
+        f"volume_backend={volume_backend})"
     )
-    return FFSModel(model=model, max_disp=int(max_disp), valid_iters=int(valid_iters))
+    return FFSModel(
+        model=model,
+        max_disp=int(max_disp),
+        valid_iters=int(valid_iters),
+        volume_backend=volume_backend,
+    )
 
 
 def _padder(shape):
@@ -170,12 +184,13 @@ def _forward(
     right: torch.Tensor,
     valid_iters: int,
     low_memory: bool,
+    volume_backend: str = "pytorch1",
 ) -> torch.Tensor:
     attempts = [
         dict(
             iters=valid_iters,
             test_mode=True,
-            optimize_build_volume="pytorch1",
+            optimize_build_volume=volume_backend,
             low_memory=low_memory,
         ),
         dict(iters=valid_iters, test_mode=True, low_memory=low_memory),
@@ -204,9 +219,15 @@ def _run_once(wrapper: FFSModel, left: torch.Tensor, right: torch.Tensor, use_am
     with torch.no_grad():
         if use_amp and left_pad.is_cuda:
             with torch.autocast("cuda", dtype=torch.float16):
-                disp = _forward(wrapper.model, left_pad, right_pad, wrapper.valid_iters, low_memory)
+                disp = _forward(
+                    wrapper.model, left_pad, right_pad, wrapper.valid_iters,
+                    low_memory, wrapper.volume_backend,
+                )
         else:
-            disp = _forward(wrapper.model, left_pad, right_pad, wrapper.valid_iters, low_memory)
+            disp = _forward(
+                wrapper.model, left_pad, right_pad, wrapper.valid_iters,
+                low_memory, wrapper.volume_backend,
+            )
     if left_pad.is_cuda:
         torch.cuda.synchronize(left_pad.device)
     elapsed = time.perf_counter() - t0

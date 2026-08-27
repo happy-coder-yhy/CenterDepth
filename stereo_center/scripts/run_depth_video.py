@@ -562,6 +562,13 @@ def main() -> None:
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
+    parser.add_argument(
+        "--ffs-volume-backend",
+        type=str,
+        default="pytorch1",
+        choices=["pytorch1", "triton"],
+        help="FFS 代价体构建后端；triton 显存更低，默认保持 pytorch1",
+    )
     add_stereonet_arguments(parser)
     add_model_iteration_arguments(parser)
     add_opencv_bm_arguments(parser)
@@ -691,6 +698,7 @@ def main() -> None:
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
         ffs_root=args.ffs_root,
+        ffs_volume_backend=args.ffs_volume_backend,
         stereonet_root=args.stereonet_root,
         max_side=args.stereonet_max_side,
         valid_iters=model_iters,
@@ -1057,6 +1065,7 @@ def main() -> None:
         "output_view": args.output_view,
         "batch_size": args.batch_size,
         "iters": model_iters,
+        "ffs_volume_backend": args.ffs_volume_backend if backend == "ffs" else None,
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,
@@ -1109,6 +1118,7 @@ def main() -> None:
         "stereo_backend": backend,
         "model_type": args.model_type,
         "iters": model_iters,
+        "ffs_volume_backend": args.ffs_volume_backend if backend == "ffs" else None,
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,

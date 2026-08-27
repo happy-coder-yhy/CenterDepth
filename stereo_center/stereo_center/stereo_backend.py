@@ -72,6 +72,7 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             max_disp=kwargs.get("max_disp", 416),
             valid_iters=kwargs.get("valid_iters", 8),
             ffs_root=kwargs.get("ffs_root"),
+            volume_backend=kwargs.get("ffs_volume_backend", "pytorch1"),
         )
     if backend == "stereonet":
         from . import stereonet_inference
