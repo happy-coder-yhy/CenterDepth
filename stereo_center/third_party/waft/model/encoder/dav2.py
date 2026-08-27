@@ -12,6 +12,7 @@ from peft import LoraConfig, get_peft_model
 from einops import rearrange
 from thirdparty.DepthAnythingV2.depth_anything_v2.dpt import DepthAnythingV2
 from model.layers.dpt import UpsampleFeats, ProjFeats
+from stereo_center.weight_paths import resolve_depth_anything_checkpoint
 
 DEPTH_ANYTHING_CONFIGS = {
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
@@ -23,26 +24,8 @@ MODULE_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _resolve_depth_anything_ckpt(model_name: str) -> Path | None:
-    """查找 Depth Anything V2 预训练权重。
-
-    兼容旧的 `depth-anything-ckpts/` 目录，同时优先使用仓库内统一管理的
-    `weights/depth-anything-ckpts/`。这样权重不再依赖当前工作目录。
-    """
-    ckpt_name = f"depth_anything_v2_{model_name}.pth"
-    env_dir = os.environ.get("DAV2_CKPT_DIR")
-    candidates = []
-    if env_dir:
-        candidates.append(Path(env_dir).expanduser() / ckpt_name)
-    candidates.extend([
-        MODULE_ROOT / "weights" / "depth-anything-ckpts" / ckpt_name,
-        MODULE_ROOT / "weights" / "pretrain_weights" / ckpt_name,
-        MODULE_ROOT / "depth-anything-ckpts" / ckpt_name,
-        Path.cwd() / "depth-anything-ckpts" / ckpt_name,
-    ])
-    for ckpt in candidates:
-        if ckpt.exists():
-            return ckpt
-    return None
+    """Resolve the canonical repository-level Depth Anything V2 checkpoint."""
+    return resolve_depth_anything_checkpoint(model_name, MODULE_ROOT)
 
 
 class DAv2Encoder(nn.Module):
@@ -57,10 +40,7 @@ class DAv2Encoder(nn.Module):
             print(
                 f"Warning: checkpoint for depth anything v2 {model_name} not found, "
                 f"using random weights. Searched: "
-                f"{MODULE_ROOT / 'weights' / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}, "
-                f"{MODULE_ROOT / 'weights' / 'pretrain_weights' / f'depth_anything_v2_{model_name}.pth'}, "
-                f"{MODULE_ROOT / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}, "
-                f"{Path.cwd() / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}"
+                f"{MODULE_ROOT.parent / 'weights' / 'depth-anything-ckpts' / f'depth_anything_v2_{model_name}.pth'}"
             )
         self.dpt_configs = {
             'vitl': {'n_layers': 24, "dim": 1024},
