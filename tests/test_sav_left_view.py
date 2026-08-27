@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -18,6 +19,25 @@ spec.loader.exec_module(run_depth_video_sav)
 
 
 class SavLeftViewTests(unittest.TestCase):
+    def test_gpu_peak_memory_reports_reserved_cuda_memory_in_gib(self):
+        with (
+            patch.object(run_depth_video_sav.torch.cuda, "is_available", return_value=True),
+            patch.object(run_depth_video_sav.torch.cuda, "synchronize") as synchronize,
+            patch.object(run_depth_video_sav.torch.cuda, "reset_peak_memory_stats") as reset,
+            patch.object(
+                run_depth_video_sav.torch.cuda,
+                "max_memory_reserved",
+                return_value=3 * 1024 * 1024 * 1024,
+            ),
+        ):
+            enabled = run_depth_video_sav.reset_gpu_peak_memory("cuda:0")
+            peak_gib = run_depth_video_sav.gpu_peak_memory_gib("cuda:0", enabled)
+
+        self.assertTrue(enabled)
+        self.assertEqual(peak_gib, 3.0)
+        self.assertEqual(synchronize.call_count, 2)
+        reset.assert_called_once_with("cuda:0")
+
     def test_left_view_depth_uses_left_disparity_without_center_fusion(self):
         disparity = torch.tensor([[[5.0, 0.0], [10.0, -1.0]]])
 

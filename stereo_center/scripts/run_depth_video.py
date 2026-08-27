@@ -34,6 +34,10 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
         sys.path.insert(0, str(_p))
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
+from stereo_center.gpu_memory import (  # noqa: E402
+    gpu_peak_memory_gib,
+    reset_gpu_peak_memory,
+)
 from stereo_center.orbbec import (  # noqa: E402
     forward_decode_read_count,
     load_pts_us,
@@ -92,25 +96,6 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
 def timing_artifact_name(backend: str) -> str:
     """Return backend-specific timing artifact filename."""
     return f"{backend}_timing.json"
-
-
-def reset_gpu_peak_memory(device: str) -> bool:
-    """Start a CUDA allocator peak-memory measurement for this process."""
-    if not str(device).startswith("cuda"):
-        return False
-    if not torch.cuda.is_available():
-        return False
-    torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    return True
-
-
-def gpu_peak_memory_gib(device: str, enabled: bool) -> float | None:
-    """Return the measured CUDA allocator peak in GiB, if tracking is enabled."""
-    if not enabled:
-        return None
-    torch.cuda.synchronize(device)
-    return round(torch.cuda.max_memory_reserved(device) / (1024 ** 3), 2)
 
 
 def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:

@@ -34,6 +34,10 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
         sys.path.insert(0, str(_p))
 
 from stereo_center import calib, sav_inference, softsplat  # noqa: E402
+from stereo_center.gpu_memory import (  # noqa: E402
+    gpu_peak_memory_gib,
+    reset_gpu_peak_memory,
+)
 from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.visualize import (  # noqa: E402
     colorize_depth_log,
@@ -231,6 +235,7 @@ def main() -> None:
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     args = parser.parse_args()
+    gpu_memory_tracking = reset_gpu_peak_memory(args.device)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -395,12 +400,18 @@ def main() -> None:
     if cap_right is not None:
         cap_right.release()
     total_s = time.time() - t_all
+    peak_gpu_memory_gib = gpu_peak_memory_gib(args.device, gpu_memory_tracking)
+    peak_gpu_memory_source = (
+        "torch.cuda.max_memory_reserved" if gpu_memory_tracking else None
+    )
     stats = {
         "video": str(args.video),
         "scale": args.scale,
         "stereo_backend": "stereoanyvideo",
         "model": "StereoAnyVideo_SF",
         "ckpt": str(ckpt),
+        "peak_gpu_memory_gib": peak_gpu_memory_gib,
+        "peak_gpu_memory_source": peak_gpu_memory_source,
         "iters": args.iters,
         "seg_len": seg_len,
         "overlap": overlap,
@@ -432,6 +443,8 @@ def main() -> None:
         "video_right": str(args.video_right) if args.video_right else None,
         "backend": "stereoanyvideo",
         "model": "StereoAnyVideo_SF",
+        "peak_gpu_memory_gib": peak_gpu_memory_gib,
+        "peak_gpu_memory_source": peak_gpu_memory_source,
         "bidirectional": bool(args.bi),
         "output_view": args.output_view,
         "scale": args.scale,
