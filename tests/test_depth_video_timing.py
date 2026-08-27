@@ -5,6 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "stereo_center" / "scripts" / "run_depth_video.py"
@@ -15,6 +16,34 @@ spec.loader.exec_module(run_depth_video)
 
 
 class DepthVideoTimingTests(unittest.TestCase):
+    def test_gpu_peak_memory_records_reserved_cuda_memory_in_mib(self):
+        with (
+            patch.object(run_depth_video.torch.cuda, "is_available", return_value=True),
+            patch.object(run_depth_video.torch.cuda, "synchronize") as synchronize,
+            patch.object(run_depth_video.torch.cuda, "reset_peak_memory_stats") as reset,
+            patch.object(
+                run_depth_video.torch.cuda,
+                "max_memory_reserved",
+                return_value=1536 * 1024 * 1024,
+            ),
+        ):
+            enabled = run_depth_video.reset_gpu_peak_memory("cuda:0")
+            peak_mib = run_depth_video.gpu_peak_memory_mib("cuda:0", enabled)
+
+        self.assertTrue(enabled)
+        self.assertEqual(peak_mib, 1536.0)
+        self.assertEqual(synchronize.call_count, 2)
+        reset.assert_called_once_with("cuda:0")
+
+    def test_gpu_peak_memory_is_null_for_cpu_runs(self):
+        with patch.object(run_depth_video.torch.cuda, "is_available") as available:
+            enabled = run_depth_video.reset_gpu_peak_memory("cpu")
+            peak_mib = run_depth_video.gpu_peak_memory_mib("cpu", enabled)
+
+        self.assertFalse(enabled)
+        self.assertIsNone(peak_mib)
+        available.assert_not_called()
+
     def test_timing_artifact_name_uses_backend(self):
         self.assertEqual(run_depth_video.timing_artifact_name("waft"), "waft_timing.json")
         self.assertEqual(run_depth_video.timing_artifact_name("ffs"), "ffs_timing.json")

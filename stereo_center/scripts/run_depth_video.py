@@ -94,6 +94,25 @@ def timing_artifact_name(backend: str) -> str:
     return f"{backend}_timing.json"
 
 
+def reset_gpu_peak_memory(device: str) -> bool:
+    """Start a CUDA allocator peak-memory measurement for this process."""
+    if not str(device).startswith("cuda"):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    return True
+
+
+def gpu_peak_memory_mib(device: str, enabled: bool) -> float | None:
+    """Return the measured CUDA allocator peak in MiB, if tracking is enabled."""
+    if not enabled:
+        return None
+    torch.cuda.synchronize(device)
+    return round(torch.cuda.max_memory_reserved(device) / (1024 ** 2), 2)
+
+
 def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the public model refinement iteration flag and legacy aliases."""
     parser.add_argument(
@@ -634,6 +653,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     t_program = time.perf_counter()
+    gpu_memory_tracking = reset_gpu_peak_memory(args.device)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1039,6 +1059,10 @@ def main() -> None:
         + t_depth_gf + t_color + t_write
     )
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
+    peak_gpu_memory_mib = gpu_peak_memory_mib(args.device, gpu_memory_tracking)
+    peak_gpu_memory_source = (
+        "torch.cuda.max_memory_reserved" if gpu_memory_tracking else None
+    )
     timing_filename = timing_artifact_name(backend)
     stereo_timing = {
         "video": str(args.video),
@@ -1048,6 +1072,8 @@ def main() -> None:
         "output_view": args.output_view,
         "batch_size": args.batch_size,
         "iters": model_iters,
+        "peak_gpu_memory_mib": peak_gpu_memory_mib,
+        "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
@@ -1098,6 +1124,8 @@ def main() -> None:
         "stereo_backend": backend,
         "model_type": args.model_type,
         "iters": model_iters,
+        "peak_gpu_memory_mib": peak_gpu_memory_mib,
+        "peak_gpu_memory_source": peak_gpu_memory_source,
         "stereonet": stereonet_metadata,
         "bidirectional": bool(args.bi),
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
