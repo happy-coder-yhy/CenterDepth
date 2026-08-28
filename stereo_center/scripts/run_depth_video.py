@@ -98,6 +98,24 @@ def timing_artifact_name(backend: str) -> str:
     return f"{backend}_timing.json"
 
 
+def exclusive_timing_summary(
+    total_seconds: float, stages: dict[str, float]
+) -> dict[str, float | dict[str, float]]:
+    """Close mutually exclusive main-loop stages against the measured wall time."""
+    explicit_seconds = sum(stages.values())
+    return {
+        "exclusive_stage_seconds": stages,
+        "explicit_seconds": explicit_seconds,
+        "loop_uninstrumented_seconds": max(total_seconds - explicit_seconds, 0.0),
+    }
+
+
+def synchronize_timing_device(device: str) -> None:
+    """Make CUDA work attributable to the timing interval that launched it."""
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
 def add_model_iteration_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the public model refinement iteration flag and legacy aliases."""
     parser.add_argument(
@@ -387,15 +405,18 @@ def process_batch(
         rgb_b: (B, 3, H, W) float32 GPU RGB（0-255）。
     """
     timing = {
+        "input_tensor_prepare": 0.0,
         "stereo_forward": 0.0,
         "stereo_total": 0.0,
         "stereo_detail": None,
+        "left_depth_projection": 0.0,
         "photo_align": 0.0,
         "center_fusion": 0.0,
         "fill": 0.0,
         "depth_gf": 0.0,
     }
 
+    t0 = time.perf_counter()
     B = len(bgr_pairs)
     H, W = bgr_pairs[0][0].shape[:2]
     left_t = torch.zeros(B, 3, H, W)
@@ -403,6 +424,7 @@ def process_batch(
     for b, (rL, rR) in enumerate(bgr_pairs):
         left_t[b] = torch.from_numpy(cv2.cvtColor(rL, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
         right_t[b] = torch.from_numpy(cv2.cvtColor(rR, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float()
+    timing["input_tensor_prepare"] += time.perf_counter() - t0
 
     if args.stereo_backend == "waft":
         from stereo_center import waft_inference  # noqa: E402  # 懒加载：仅 waft 路径需要 peft 等
@@ -480,10 +502,14 @@ def process_batch(
         dR = torch.from_numpy(dR) if dR is not None else None
     dev = args.device
     if args.output_view == "left":
+        synchronize_timing_device(dev)
+        t0 = time.perf_counter()
         dep_b, valid_b = left_view_depth_from_disparity(
             dL, occL, fx, baseline, dev, valid_mode=args.left_vis_mode
         )
         rgb_b = left_t.to(dev)
+        synchronize_timing_device(dev)
+        timing["left_depth_projection"] += time.perf_counter() - t0
         return dep_b, valid_b, rgb_b, timing
 
     # 保持逐帧光度校正，但将中心视角融合本身一次性按 B 帧执行，
@@ -662,7 +688,12 @@ def main() -> None:
     t_temporal_flow_model_load = 0.0
     t_decode = 0.0
     t_rectify = 0.0
+    t_input_tensor_prepare = 0.0
     t_waft = 0.0
+    t_left_depth_projection = 0.0
+    t_frame_gpu_postprocess = 0.0
+    t_frame_download = 0.0
+    t_frame_cpu_postprocess = 0.0
     t_align = 0.0
     t_fusion = 0.0
     t_fill = 0.0
@@ -799,7 +830,7 @@ def main() -> None:
         (W, H),
     )
 
-    t_all = time.time()
+    t_all = time.perf_counter()
     depth_tbuf = deque(maxlen=max(1, args.temporal_median))
     win = max(1, args.temporal_median)
     prev_gray = None
@@ -884,7 +915,9 @@ def main() -> None:
             temporal_flow_model=raft if args.waft_temporal_init else None,
             temporal_state=temporal_state,
         )
+        t_input_tensor_prepare += timing["input_tensor_prepare"]
         t_waft += timing["stereo_forward"]
+        t_left_depth_projection += timing["left_depth_projection"]
         t_align += timing["photo_align"]
         t_fusion += timing["center_fusion"]
         t_fill += timing["fill"]
@@ -916,6 +949,7 @@ def main() -> None:
 
         for b in range(B):
             rL_bgr, rR_bgr = bgr_pairs[b]
+            t0 = time.perf_counter()
             d_cur = dep_b[b].unsqueeze(0)  # (1,1,H,W) GPU
             v_cur = valid_b[b].unsqueeze(0)
             if win > 1:
@@ -961,8 +995,13 @@ def main() -> None:
                     ) + (1.0 - g) * d_cur
                 prev_left_t = cur_left_t
                 prev_depth_t = d_cur.detach()
+            synchronize_timing_device(args.device)
+            t_frame_gpu_postprocess += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             dep_np = d_cur[0, 0].cpu().numpy()
             valid_np = v_cur[0, 0].cpu().numpy().astype(bool)
+            t_frame_download += time.perf_counter() - t0
             if args.left_hole_fill:
                 t0 = time.perf_counter()
                 dep_np, valid_np, fill_stats = fill_small_left_holes(
@@ -973,6 +1012,7 @@ def main() -> None:
                 t_left_hole_fill += time.perf_counter() - t0
                 left_hole_fill_components += fill_stats["filled_components"]
                 left_hole_fill_pixels += fill_stats["filled_pixels"]
+            t0 = time.perf_counter()
             if args.spatial_median > 1:
                 dep_np = cv2.medianBlur(dep_np, args.spatial_median)
             # 时间 EMA：默认用光流把上一帧深度 warp 到当前帧再融合（运动补偿）
@@ -1000,6 +1040,7 @@ def main() -> None:
                     dep_np = np.where(valid_np, smoothed, dep_np)
                 prev_gray = cur_gray
                 prev_depth = dep_np
+            t_frame_cpu_postprocess += time.perf_counter() - t0
             t0 = time.perf_counter()
             depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
             t_color += time.perf_counter() - t0
@@ -1019,7 +1060,7 @@ def main() -> None:
 
         frame_idx += B
         if processed % (args.batch_size * 10) == 0 or frame_idx >= end:
-            rate = processed / max(time.time() - t_all, 1e-6)
+            rate = processed / max(time.perf_counter() - t_all, 1e-6)
             eta = (end - frame_idx) / rate if rate > 0 else 0
             print(
                 f"[progress] {processed}/{end - args.start_frame} 帧，"
@@ -1031,7 +1072,7 @@ def main() -> None:
     cap.release()
     if cap_right is not None:
         cap_right.release()
-    total_s = time.time() - t_all
+    total_s = time.perf_counter() - t_all
     e2e_s = time.perf_counter() - t_program
     waft_stage_seconds = {}
     for record in waft_timing_records:
@@ -1047,10 +1088,23 @@ def main() -> None:
         "model_forward_seconds",
         waft_stage_seconds.get("stereo_forward_seconds", 0.0),
     )
-    proc_s = (
-        stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill
-        + t_depth_gf + t_color + t_write
-    )
+    exclusive_timing = exclusive_timing_summary(total_s, {
+        "video_decode_locate_seconds": t_decode,
+        "stereo_rectify_seconds": t_rectify,
+        "input_tensor_prepare_seconds": t_input_tensor_prepare,
+        "stereo_pipeline_seconds": stereo_total_s,
+        "left_depth_projection_seconds": t_left_depth_projection,
+        "frame_gpu_postprocess_seconds": t_frame_gpu_postprocess,
+        "frame_download_seconds": t_frame_download,
+        "frame_cpu_postprocess_seconds": t_frame_cpu_postprocess,
+        "photometric_align_seconds": t_align,
+        "center_fusion_seconds": t_fusion,
+        "disocclusion_fill_seconds": t_fill,
+        "left_hole_fill_seconds": t_left_hole_fill,
+        "depth_guided_filter_seconds": t_depth_gf,
+        "depth_colorize_seconds": t_color,
+        "video_write_seconds": t_write,
+    })
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
     peak_gpu_memory_gib = gpu_peak_memory_gib(args.device, gpu_memory_tracking)
     peak_gpu_memory_source = (
@@ -1094,6 +1148,16 @@ def main() -> None:
             "disp_rel_tol": args.waft_temporal_disp_rel_tol,
         } if args.waft_temporal_init else None,
         "stage_seconds": {key: round(value, 6) for key, value in waft_stage_seconds.items()},
+        "exclusive_timing": {
+            "exclusive_stage_seconds": {
+                key: round(value, 6)
+                for key, value in exclusive_timing["exclusive_stage_seconds"].items()
+            },
+            "explicit_seconds": round(exclusive_timing["explicit_seconds"], 6),
+            "loop_uninstrumented_seconds": round(
+                exclusive_timing["loop_uninstrumented_seconds"], 6
+            ),
+        },
         "average_seconds_per_batch": {
             key: round(value / max(len(waft_timing_records), 1), 6)
             for key, value in waft_stage_seconds.items()
@@ -1177,10 +1241,15 @@ def main() -> None:
         ),
         "stage_video_decode_locate_seconds": round(t_decode, 2),
         "stage_stereo_rectify_seconds": round(t_rectify, 2),
+        "stage_input_tensor_prepare_seconds": round(t_input_tensor_prepare, 2),
         "stage_waft_forward_seconds": round(t_waft, 2),
         "stage_waft_pipeline_seconds": round(stereo_total_s, 2),
         "stage_stereo_forward_seconds": round(t_waft, 2),
         "stage_stereo_pipeline_seconds": round(stereo_total_s, 2),
+        "stage_left_depth_projection_seconds": round(t_left_depth_projection, 2),
+        "stage_frame_gpu_postprocess_seconds": round(t_frame_gpu_postprocess, 2),
+        "stage_frame_download_seconds": round(t_frame_download, 2),
+        "stage_frame_cpu_postprocess_seconds": round(t_frame_cpu_postprocess, 2),
         "stereo_timing_file": timing_filename,
         "stage_photometric_align_seconds": round(t_align, 2),
         "stage_center_fusion_seconds": round(t_fusion, 2),
@@ -1193,8 +1262,18 @@ def main() -> None:
         "stage_stereo_fusion_fill_seconds": round(
             stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill + t_depth_gf, 2
         ),
-        "stage_main_process_seconds": round(proc_s, 2),
-        "stage_other_seconds": round(max(total_s - proc_s, 0), 2),
+        "exclusive_timing": {
+            "exclusive_stage_seconds": {
+                key: round(value, 6)
+                for key, value in exclusive_timing["exclusive_stage_seconds"].items()
+            },
+            "explicit_seconds": round(exclusive_timing["explicit_seconds"], 6),
+            "loop_uninstrumented_seconds": round(
+                exclusive_timing["loop_uninstrumented_seconds"], 6
+            ),
+        },
+        "stage_main_process_seconds": round(exclusive_timing["explicit_seconds"], 2),
+        "stage_other_seconds": round(exclusive_timing["loop_uninstrumented_seconds"], 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")
@@ -1203,6 +1282,7 @@ def main() -> None:
         print(f"[timing] RAFT 光流模型加载 {t_temporal_flow_model_load:.2f}s")
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
+    print(f"[timing] 输入张量准备 {t_input_tensor_prepare:.2f}s")
     backend_label = backend.upper()
     direction_label = "双向" if args.bi else "单向"
     print(f"[timing] {backend_label} {direction_label}前向 {t_waft:.2f}s")
@@ -1217,8 +1297,16 @@ def main() -> None:
     print(f"[timing] 中心视角融合 {t_fusion:.2f}s")
     print(f"[timing] 遮挡补洞 {t_fill:.2f}s")
     print(f"[timing] 左视角小孔洞补全 {t_left_hole_fill:.2f}s")
+    print(f"[timing] 左视差转米制深度 {t_left_depth_projection:.2f}s")
+    print(f"[timing] 逐帧 GPU 后处理 {t_frame_gpu_postprocess:.2f}s")
+    print(f"[timing] 逐帧 GPU 到 CPU 下载 {t_frame_download:.2f}s")
+    print(f"[timing] 逐帧 CPU 后处理 {t_frame_cpu_postprocess:.2f}s")
     print(f"[timing] 深度着色 {t_color:.2f}s")
     print(f"[timing] 视频写盘 {t_write:.2f}s（其中 PNG {t_png_write:.2f}s）")
+    print(
+        f"[timing] 互斥阶段合计 {exclusive_timing['explicit_seconds']:.2f}s，"
+        f"未归类循环残差 {exclusive_timing['loop_uninstrumented_seconds']:.2f}s"
+    )
     print(f"[timing] 脚本总耗时 {total_s:.2f}s")
     print(f"[timing] 端到端耗时 {e2e_s:.2f}s")
     print(f"[out] {outdir / args.video_name}")

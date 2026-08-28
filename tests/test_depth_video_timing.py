@@ -16,6 +16,25 @@ spec.loader.exec_module(run_depth_video)
 
 
 class DepthVideoTimingTests(unittest.TestCase):
+    def test_exclusive_timing_summary_closes_to_total_without_nested_forward(self):
+        stages = {
+            "video_decode_locate_seconds": 1.0,
+            "stereo_rectify_seconds": 2.0,
+            "input_tensor_prepare_seconds": 3.0,
+            "stereo_pipeline_seconds": 4.0,
+            "left_depth_projection_seconds": 1.5,
+            "frame_download_seconds": 2.5,
+            "frame_postprocess_seconds": 1.0,
+            "depth_colorize_seconds": 2.0,
+            "video_write_seconds": 1.0,
+        }
+
+        summary = run_depth_video.exclusive_timing_summary(18.0, stages)
+
+        self.assertEqual(summary["exclusive_stage_seconds"], stages)
+        self.assertEqual(summary["explicit_seconds"], 18.0)
+        self.assertEqual(summary["loop_uninstrumented_seconds"], 0.0)
+
     def test_gpu_peak_memory_records_reserved_cuda_memory_in_gib(self):
         with (
             patch.object(run_depth_video.torch.cuda, "is_available", return_value=True),
