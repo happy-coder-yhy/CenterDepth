@@ -36,6 +36,18 @@ class LeftViewDepthTests(unittest.TestCase):
 
         self.assertEqual(valid.tolist(), [[[[True, True, False]]]])
 
+    def test_single_sample_disparity_keeps_batch_dimension(self):
+        disp = torch.tensor([[2.0, 4.0, 0.0]])
+        occ = torch.tensor([[1.0, 0.0, 1.0]])
+
+        depth, valid = run_depth_video.left_view_depth_from_disparity(
+            disp, occ, fx=100.0, baseline=0.1, device="cpu"
+        )
+
+        self.assertEqual(depth.shape, (1, 1, 1, 3))
+        self.assertEqual(valid.shape, (1, 1, 1, 3))
+        self.assertEqual(valid.tolist(), [[[[True, False, False]]]])
+
 
 if __name__ == "__main__":
     unittest.main()

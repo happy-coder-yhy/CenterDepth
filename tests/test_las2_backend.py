@@ -13,6 +13,21 @@ from stereo_center import las2_inference
 
 
 class LAS2BackendTests(unittest.TestCase):
+    def test_tensor_rt_runtime_uses_tensor_rt_loader(self):
+        from stereo_center import stereo_backend
+
+        sentinel = object()
+        with mock.patch(
+            "stereo_center.las2_tensorrt_inference.load_las2_tensorrt",
+            return_value=sentinel,
+        ) as loader:
+            result = stereo_backend.load(
+                "las2", "L", "weights", "cuda", runtime="tensorrt",
+                engine_dir="engines", batch_size=12, max_disp=192,
+            )
+        self.assertIs(result, sentinel)
+        loader.assert_called_once_with("engines", "cuda", batch_size=12, max_disp=192)
+
     def test_single_direction_ignores_backend_compatibility_kwargs(self):
         left = torch.zeros(2, 3, 4, 5)
         right = torch.zeros(2, 3, 4, 5)

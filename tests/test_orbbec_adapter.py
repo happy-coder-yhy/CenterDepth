@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -19,6 +20,14 @@ from stereo_center.orbbec import (
 
 
 class OrbbecCalibrationTests(unittest.TestCase):
+    def test_zero_disparity_flag_supports_opencv5_namespace(self):
+        fake_cv2 = SimpleNamespace(
+            CALIB_ZERO_DISPARITY=1024,
+            fisheye=SimpleNamespace(),
+        )
+
+        self.assertEqual(calib.zero_disparity_flag(fake_cv2), 1024)
+
     def test_load_orbbec_calibration_preserves_relative_pose_in_meters(self):
         content = """
 calibration_info:

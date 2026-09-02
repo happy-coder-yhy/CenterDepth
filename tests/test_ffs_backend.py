@@ -61,6 +61,21 @@ class FFSBackendTests(unittest.TestCase):
         self.assertEqual(tuple(conf.shape), (2, 4, 5))
         self.assertEqual(elapsed, 0.25)
 
+    def test_single_direction_batch_wrapper_preserves_one_sample_batch(self):
+        left = torch.zeros(1, 3, 4, 5)
+        right = torch.zeros(1, 3, 4, 5)
+        disp = torch.ones(1, 4, 5)
+
+        with mock.patch.object(ffs_inference, "_run_once", return_value=(disp, 0.25)):
+            out_disp, occ, conf, elapsed = ffs_inference.run_stereo_matching_batch(
+                object(), left, right, "cpu"
+            )
+
+        self.assertEqual(tuple(out_disp.shape), (1, 4, 5))
+        self.assertEqual(tuple(occ.shape), (1, 4, 5))
+        self.assertEqual(tuple(conf.shape), (1, 4, 5))
+        self.assertEqual(elapsed, 0.25)
+
     def test_forward_passes_requested_triton_volume_backend(self):
         class Model:
             def __init__(self):

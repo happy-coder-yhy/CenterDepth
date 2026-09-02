@@ -110,6 +110,17 @@ def load_orbbec_calibration(calib_path: str | Path) -> Dict:
     }
 
 
+def zero_disparity_flag(cv2_module=cv2) -> int:
+    """Return the zero-disparity flag across OpenCV 4 and 5 namespaces."""
+    return int(
+        getattr(
+            cv2_module.fisheye,
+            "CALIB_ZERO_DISPARITY",
+            cv2_module.CALIB_ZERO_DISPARITY,
+        )
+    )
+
+
 def compute_rectification_maps(cal: Dict, output_size: Tuple[int, int] | None = None) -> Dict:
     """Generate fisheye stereo rectification maps.
 
@@ -134,7 +145,7 @@ def compute_rectification_maps(cal: Dict, output_size: Tuple[int, int] | None = 
         src_size,
         R,
         t,
-        flags=cv2.fisheye.CALIB_ZERO_DISPARITY,
+        flags=zero_disparity_flag(),
         newImageSize=out_size,
     )
     map1L, map2L = cv2.fisheye.initUndistortRectifyMap(

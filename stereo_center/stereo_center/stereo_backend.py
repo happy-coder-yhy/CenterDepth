@@ -57,6 +57,14 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             model_type, weights_dir, device, iters=kwargs.get("iters")
         )
     if backend == "las2":
+        if kwargs.get("runtime", "pytorch") == "tensorrt":
+            from . import las2_tensorrt_inference
+
+            return las2_tensorrt_inference.load_las2_tensorrt(
+                kwargs.get("engine_dir"), device,
+                batch_size=kwargs.get("batch_size", 16),
+                max_disp=kwargs.get("max_disp", 192),
+            )
         from . import las2_inference
 
         return las2_inference.load_las2(
@@ -65,6 +73,13 @@ def load(backend: str, model_type: str, weights_dir: str, device: str, **kwargs)
             las_root=kwargs.get("las_root"),
         )
     if backend == "ffs":
+        if kwargs.get("runtime", "pytorch") == "tensorrt":
+            from . import ffs_tensorrt_inference
+
+            return ffs_tensorrt_inference.load_ffs_tensorrt(
+                kwargs.get("engine_dir"), kwargs.get("ffs_root"), device,
+                batch_size=kwargs.get("batch_size", 12),
+            )
         from . import ffs_inference
 
         return ffs_inference.load_ffs(
@@ -110,10 +125,22 @@ def run(backend: str, model, left, right, device: str, **kwargs):
 
         return waft_inference.run_stereo_matching(model, left, right, device, **kwargs)
     if backend == "las2":
+        if getattr(model, "runtime", "pytorch") == "tensorrt":
+            from . import las2_tensorrt_inference
+
+            return las2_tensorrt_inference.run_stereo_matching(
+                model, left, right, device, **kwargs
+            )
         from . import las2_inference
 
         return las2_inference.run_stereo_matching(model, left, right, device, **kwargs)
     if backend == "ffs":
+        if getattr(model, "runtime", "pytorch") == "tensorrt":
+            from . import ffs_tensorrt_inference
+
+            return ffs_tensorrt_inference.run_stereo_matching(
+                model, left, right, device, **kwargs
+            )
         from . import ffs_inference
 
         return ffs_inference.run_stereo_matching(model, left, right, device, **kwargs)
@@ -147,6 +174,12 @@ def run_bi(backend: str, model, left, right, device: str, **kwargs):
 
         return waft_inference.run_stereo_matching_bi(model, left, right, device, **kwargs)
     if backend == "las2":
+        if getattr(model, "runtime", "pytorch") == "tensorrt":
+            from . import las2_tensorrt_inference
+
+            return las2_tensorrt_inference.run_stereo_matching(
+                model, left, right, device, **kwargs
+            )
         from . import las2_inference
 
         return las2_inference.run_stereo_matching_bi(model, left, right, device, **kwargs)
@@ -164,6 +197,8 @@ def run_bi_batch(backend: str, model, left, right, device: str, **kwargs):
 
         return waft_inference.run_stereo_matching_bi_batch(model, left, right, device, **kwargs)
     if backend == "las2":
+        if getattr(model, "runtime", "pytorch") == "tensorrt":
+            raise ValueError("LAS2 TensorRT currently supports bi=0 only")
         from . import las2_inference
 
         return las2_inference.run_stereo_matching_bi_batch(model, left, right, device, **kwargs)

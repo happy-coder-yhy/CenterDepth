@@ -297,6 +297,28 @@ def run_stereo_matching(
 
 
 @torch.no_grad()
+def run_stereo_matching_batch(
+    model: FFSModel,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    device: str = "cuda",
+    use_amp: bool = True,
+    **_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Run one-way FFS inference while always preserving the batch dimension."""
+    if getattr(model, "runtime", "pytorch") == "tensorrt":
+        from . import ffs_tensorrt_inference
+
+        return ffs_tensorrt_inference.run_stereo_matching_batch(
+            model, left, right, device, **_kwargs
+        )
+    disp, elapsed = _run_once(model, left.to(device), right.to(device), use_amp)
+    occ = _visibility(disp)
+    conf = torch.ones_like(disp)
+    return disp, occ, conf, elapsed
+
+
+@torch.no_grad()
 def run_stereo_matching_bi_batch(
     model: FFSModel,
     left: torch.Tensor,

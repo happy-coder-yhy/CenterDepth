@@ -77,6 +77,15 @@ class DepthVideoTimingTests(unittest.TestCase):
             run_depth_video.timing_artifact_name("stereonet"), "stereonet_timing.json"
         )
 
+    def test_video_artifacts_include_zarr_and_exclude_colorbar(self):
+        artifacts = run_depth_video.video_artifact_paths(
+            Path("outputs/example"), "depth_video.mp4", "ffs_timing.json"
+        )
+
+        self.assertEqual(artifacts["video"], Path("outputs/example/depth_video.mp4"))
+        self.assertEqual(artifacts["depth_zarr"], Path("outputs/example/depth.zarr"))
+        self.assertNotIn("colorbar", artifacts)
+
     def test_stereonet_is_limited_to_left_single_direction_output(self):
         valid = SimpleNamespace(
             stereo_backend="stereonet", output_view="left", bi=0

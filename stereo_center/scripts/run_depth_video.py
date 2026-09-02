@@ -34,6 +34,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
         sys.path.insert(0, str(_p))
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
+from stereo_center.depth_zarr import DepthZarrWriter  # noqa: E402
 from stereo_center.gpu_memory import (  # noqa: E402
     gpu_peak_memory_gib,
     reset_gpu_peak_memory,
@@ -49,10 +50,7 @@ from stereo_center.pipeline import photometric_align_right  # noqa: E402
 from stereo_center.guided_filter import guided_filter  # noqa: E402
 from stereo_center.left_hole_fill import fill_small_left_holes  # noqa: E402
 from stereo_center.raft_flow import flow_between, load_raft  # noqa: E402
-from stereo_center.visualize import (  # noqa: E402
-    colorize_depth_log,
-    make_depth_colorbar_log,
-)
+from stereo_center.visualize import colorize_depth_log  # noqa: E402
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
@@ -96,6 +94,19 @@ def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
 def timing_artifact_name(backend: str) -> str:
     """Return backend-specific timing artifact filename."""
     return f"{backend}_timing.json"
+
+
+def video_artifact_paths(
+    outdir: str | Path, video_name: str, timing_filename: str
+) -> dict[str, Path]:
+    """Return the stable downstream artifacts for a depth video run."""
+    root = Path(outdir)
+    return {
+        "video": root / video_name,
+        "depth_zarr": root / "depth.zarr",
+        "timing": root / timing_filename,
+        "stats": root / "stats.json",
+    }
 
 
 def exclusive_timing_summary(
@@ -371,6 +382,9 @@ def left_view_depth_from_disparity(
     (B,1,H,W) on ``device``.  Invalid pixels remain in depth for color scaling,
     but ``valid`` marks them out for visualization.
     """
+    if disp.ndim == 2:
+        disp = disp.unsqueeze(0)
+        occ = occ.unsqueeze(0)
     disp_d = disp.to(device).float()
     occ_d = occ.to(device).float()
     if valid_mode == "strict":
@@ -465,20 +479,27 @@ def process_batch(
         else:
             t0 = time.perf_counter()
             stereo_detail = {}
-            dL, occL, confL, elapsed = stereo_backend.run(
-                args.stereo_backend, model, left_t, right_t, args.device,
-                max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
-                hiera=args.hiera,
-                max_side=args.stereonet_max_side,
-                stereonet_root=args.stereonet_root,
-                timing_out=stereo_detail,
-                bm_num_disparities=args.bm_num_disparities,
-                bm_block_size=args.bm_block_size,
-                bm_uniqueness_ratio=args.bm_uniqueness_ratio,
-                bm_speckle_window_size=args.bm_speckle_window_size,
-                bm_speckle_range=args.bm_speckle_range,
-                bm_disp12_max_diff=args.bm_disp12_max_diff,
-            )
+            if args.stereo_backend == "ffs":
+                from stereo_center import ffs_inference  # noqa: E402
+
+                dL, occL, confL, elapsed = ffs_inference.run_stereo_matching_batch(
+                    model, left_t, right_t, args.device,
+                )
+            else:
+                dL, occL, confL, elapsed = stereo_backend.run(
+                    args.stereo_backend, model, left_t, right_t, args.device,
+                    max_disp=args.max_disp, conf_mode=args.conf, occ_mode=args.occ,
+                    hiera=args.hiera,
+                    max_side=args.stereonet_max_side,
+                    stereonet_root=args.stereonet_root,
+                    timing_out=stereo_detail,
+                    bm_num_disparities=args.bm_num_disparities,
+                    bm_block_size=args.bm_block_size,
+                    bm_uniqueness_ratio=args.bm_uniqueness_ratio,
+                    bm_speckle_window_size=args.bm_speckle_window_size,
+                    bm_speckle_range=args.bm_speckle_range,
+                    bm_disp12_max_diff=args.bm_disp12_max_diff,
+                )
             measured = time.perf_counter() - t0
             timing["stereo_forward"] += stereo_detail.get(
                 "model_forward_seconds", elapsed
@@ -587,7 +608,23 @@ def main() -> None:
     parser.add_argument("--model-type", type=str, default="DAv2L-5")
     parser.add_argument("--max-disp", type=int, default=192, help="LAS2 最大视差（默认 192）")
     parser.add_argument("--las-root", type=str, default=None, help="LiteAnyStereo 仓库根目录（LAS2）")
+    parser.add_argument(
+        "--las2-runtime", type=str, default="pytorch", choices=["pytorch", "tensorrt"],
+        help="LAS2 推理运行时；TensorRT 需要 --las2-trt-engine-dir",
+    )
+    parser.add_argument(
+        "--las2-trt-engine-dir", type=str, default=None,
+        help="LAS2 TensorRT 引擎目录（含 las2.engine）",
+    )
     parser.add_argument("--ffs-root", type=str, default=None, help="Fast-FoundationStereo 仓库根目录（FFS）")
+    parser.add_argument(
+        "--ffs-runtime", type=str, default="pytorch", choices=["pytorch", "tensorrt"],
+        help="FFS 推理运行时；TensorRT 需要固定 batch=12 的 split engines",
+    )
+    parser.add_argument(
+        "--ffs-trt-engine-dir", type=str, default=None,
+        help="FFS TensorRT split engine 目录（含 feature_runner.engine/post_runner.engine）",
+    )
     parser.add_argument(
         "--ffs-volume-backend",
         type=str,
@@ -701,6 +738,7 @@ def main() -> None:
     t_depth_gf = 0.0
     t_color = 0.0
     t_write = 0.0
+    t_zarr_write = 0.0
     t_png_write = 0.0
     left_hole_fill_components = 0
     left_hole_fill_pixels = 0
@@ -729,6 +767,11 @@ def main() -> None:
         backend, args.model_type, str(weights_dir), args.device,
         num_refine=3, max_disp=args.max_disp, las_root=args.las_root,
         ffs_root=args.ffs_root,
+        runtime=(args.las2_runtime if backend == "las2" else args.ffs_runtime),
+        engine_dir=(
+            args.las2_trt_engine_dir if backend == "las2" else args.ffs_trt_engine_dir
+        ),
+        batch_size=args.batch_size,
         ffs_volume_backend=args.ffs_volume_backend,
         stereonet_root=args.stereonet_root,
         max_side=args.stereonet_max_side,
@@ -817,14 +860,25 @@ def main() -> None:
     )
     print(f"[video] 共 {n_total} 帧，处理 [{args.start_frame}, {end})，输出 fps={fps:.2f}")
 
-    cv2.imwrite(
-        str(outdir / "colorbar.png"),
-        make_depth_colorbar_log(args.dmin_m, args.dmax_m, height=H),
+    timing_filename = timing_artifact_name(backend)
+    artifacts = video_artifact_paths(outdir, args.video_name, timing_filename)
+    depth_zarr = DepthZarrWriter(
+        artifacts["depth_zarr"],
+        H,
+        W,
+        metadata={
+            "fps": float(fps),
+            "backend": backend,
+            "model_type": args.model_type,
+            "scale": float(args.scale),
+            "output_view": args.output_view,
+            "source_video": str(args.video),
+            "start_frame": int(args.start_frame),
+        },
     )
-    print(f"[color] 对数米制色阶 {args.dmin_m}~{args.dmax_m}m（全片固定，colorbar.png 已保存）")
 
     writer = cv2.VideoWriter(
-        str(outdir / args.video_name),
+        str(artifacts["video"]),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (W, H),
@@ -1042,6 +1096,9 @@ def main() -> None:
                 prev_depth = dep_np
             t_frame_cpu_postprocess += time.perf_counter() - t0
             t0 = time.perf_counter()
+            depth_zarr.append(dep_np)
+            t_zarr_write += time.perf_counter() - t0
+            t0 = time.perf_counter()
             depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
             t_color += time.perf_counter() - t0
             t0 = time.perf_counter()
@@ -1069,6 +1126,7 @@ def main() -> None:
             )
 
     writer.release()
+    depth_zarr.close()
     cap.release()
     if cap_right is not None:
         cap_right.release()
@@ -1104,13 +1162,13 @@ def main() -> None:
         "depth_guided_filter_seconds": t_depth_gf,
         "depth_colorize_seconds": t_color,
         "video_write_seconds": t_write,
+        "depth_zarr_write_seconds": t_zarr_write,
     })
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
     peak_gpu_memory_gib = gpu_peak_memory_gib(args.device, gpu_memory_tracking)
     peak_gpu_memory_source = (
         "torch.cuda.max_memory_reserved" if gpu_memory_tracking else None
     )
-    timing_filename = timing_artifact_name(backend)
     stereo_timing = {
         "video": str(args.video),
         "backend": backend,
@@ -1120,8 +1178,19 @@ def main() -> None:
         "batch_size": args.batch_size,
         "iters": model_iters,
         "ffs_volume_backend": args.ffs_volume_backend if backend == "ffs" else None,
+        "ffs_runtime": args.ffs_runtime if backend == "ffs" else None,
+        "ffs_trt_engine_dir": args.ffs_trt_engine_dir if backend == "ffs" else None,
+        "las2_runtime": args.las2_runtime if backend == "las2" else None,
+        "las2_trt_engine_dir": args.las2_trt_engine_dir if backend == "las2" else None,
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
+        "depth_zarr": {
+            "path": "depth.zarr",
+            "dataset": "depth",
+            "shape": [processed, H, W],
+            "dtype": "float32",
+            "unit": "meter",
+        },
         "stereonet": stereonet_metadata,
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
         "sgbm_parameters": opencv_sgbm_parameters(args) if backend == "opencv_sgbm" else None,
@@ -1172,7 +1241,7 @@ def main() -> None:
         ),
         "batch_records": waft_timing_records,
     }
-    (outdir / timing_filename).write_text(
+    artifacts["timing"].write_text(
         json.dumps(stereo_timing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     stats = {
@@ -1183,8 +1252,19 @@ def main() -> None:
         "model_type": args.model_type,
         "iters": model_iters,
         "ffs_volume_backend": args.ffs_volume_backend if backend == "ffs" else None,
+        "ffs_runtime": args.ffs_runtime if backend == "ffs" else None,
+        "ffs_trt_engine_dir": args.ffs_trt_engine_dir if backend == "ffs" else None,
+        "las2_runtime": args.las2_runtime if backend == "las2" else None,
+        "las2_trt_engine_dir": args.las2_trt_engine_dir if backend == "las2" else None,
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
+        "depth_zarr": {
+            "path": "depth.zarr",
+            "dataset": "depth",
+            "shape": [processed, H, W],
+            "dtype": "float32",
+            "unit": "meter",
+        },
         "stereonet": stereonet_metadata,
         "bidirectional": bool(args.bi),
         "bm_parameters": opencv_bm_parameters(args) if backend == "opencv_bm" else None,
@@ -1258,6 +1338,7 @@ def main() -> None:
         "stage_depth_gf_seconds": round(t_depth_gf, 2),
         "stage_depth_colorize_seconds": round(t_color, 2),
         "stage_video_write_seconds": round(t_write, 2),
+        "stage_depth_zarr_write_seconds": round(t_zarr_write, 2),
         "stage_png_write_seconds": round(t_png_write, 2),
         "stage_stereo_fusion_fill_seconds": round(
             stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill + t_depth_gf, 2
@@ -1275,7 +1356,7 @@ def main() -> None:
         "stage_main_process_seconds": round(exclusive_timing["explicit_seconds"], 2),
         "stage_other_seconds": round(exclusive_timing["loop_uninstrumented_seconds"], 2),
     }
-    (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    artifacts["stats"].write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] {processed} 帧，总耗时 {total_s:.1f}s（{total_s/max(processed,1):.2f}s/帧）")
     print(f"[timing] 模型加载 {t_model_load:.2f}s")
     if raft is not None:
@@ -1303,14 +1384,16 @@ def main() -> None:
     print(f"[timing] 逐帧 CPU 后处理 {t_frame_cpu_postprocess:.2f}s")
     print(f"[timing] 深度着色 {t_color:.2f}s")
     print(f"[timing] 视频写盘 {t_write:.2f}s（其中 PNG {t_png_write:.2f}s）")
+    print(f"[timing] 深度 Zarr 写盘 {t_zarr_write:.2f}s")
     print(
         f"[timing] 互斥阶段合计 {exclusive_timing['explicit_seconds']:.2f}s，"
         f"未归类循环残差 {exclusive_timing['loop_uninstrumented_seconds']:.2f}s"
     )
     print(f"[timing] 脚本总耗时 {total_s:.2f}s")
     print(f"[timing] 端到端耗时 {e2e_s:.2f}s")
-    print(f"[out] {outdir / args.video_name}")
-    print(f"[out] {outdir / timing_filename}")
+    print(f"[out] {artifacts['video']}")
+    print(f"[out] {artifacts['depth_zarr']}")
+    print(f"[out] {artifacts['timing']}")
 
 
 if __name__ == "__main__":
