@@ -51,6 +51,10 @@ from stereo_center.guided_filter import guided_filter  # noqa: E402
 from stereo_center.left_hole_fill import fill_small_left_holes  # noqa: E402
 from stereo_center.raft_flow import flow_between, load_raft  # noqa: E402
 from stereo_center.visualize import colorize_depth_log  # noqa: E402
+from stereo_center.video_compression import (  # noqa: E402
+    compress_preview_video,
+    preview_video_name,
+)
 
 
 def resolve_weights_dir(explicit: str | None, backend: str) -> Path:
@@ -103,6 +107,7 @@ def video_artifact_paths(
     root = Path(outdir)
     return {
         "video": root / video_name,
+        "preview_video": root / preview_video_name(video_name),
         "depth_zarr": root / "depth.zarr",
         "timing": root / timing_filename,
         "stats": root / "stats.json",
@@ -740,6 +745,8 @@ def main() -> None:
     t_write = 0.0
     t_zarr_write = 0.0
     t_png_write = 0.0
+    t_video_compress = 0.0
+    preview_compression = None
     left_hole_fill_components = 0
     left_hole_fill_pixels = 0
     waft_timing_records = []
@@ -1127,6 +1134,11 @@ def main() -> None:
 
     writer.release()
     depth_zarr.close()
+    t0 = time.perf_counter()
+    preview_compression = compress_preview_video(
+        artifacts["video"], output_path=artifacts["preview_video"]
+    )
+    t_video_compress = time.perf_counter() - t0
     cap.release()
     if cap_right is not None:
         cap_right.release()
@@ -1163,6 +1175,7 @@ def main() -> None:
         "depth_colorize_seconds": t_color,
         "video_write_seconds": t_write,
         "depth_zarr_write_seconds": t_zarr_write,
+        "preview_video_compress_seconds": t_video_compress,
     })
     temporal_valid_ratio = weighted_temporal_valid_ratio(waft_timing_records)
     peak_gpu_memory_gib = gpu_peak_memory_gib(args.device, gpu_memory_tracking)
@@ -1184,6 +1197,9 @@ def main() -> None:
         "las2_trt_engine_dir": args.las2_trt_engine_dir if backend == "las2" else None,
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
+        "preview_video_compression": preview_compression,
+        "depth_video_path": args.video_name,
+        "depth_preview_video_path": preview_video_name(args.video_name),
         "depth_zarr": {
             "path": "depth.zarr",
             "dataset": "depth",
@@ -1339,6 +1355,8 @@ def main() -> None:
         "stage_depth_colorize_seconds": round(t_color, 2),
         "stage_video_write_seconds": round(t_write, 2),
         "stage_depth_zarr_write_seconds": round(t_zarr_write, 2),
+        "stage_preview_video_compress_seconds": round(t_video_compress, 2),
+        "preview_video_compression": preview_compression,
         "stage_png_write_seconds": round(t_png_write, 2),
         "stage_stereo_fusion_fill_seconds": round(
             stereo_total_s + t_align + t_fusion + t_fill + t_left_hole_fill + t_depth_gf, 2

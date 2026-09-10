@@ -10,3 +10,4 @@ outputs/
 __pycache__
 dataset/
 stereo_center/third_party/StereoNet_PyTorch/
+weights/

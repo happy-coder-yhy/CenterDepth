@@ -43,6 +43,10 @@ from stereo_center.visualize import (  # noqa: E402
     colorize_depth_log,
     make_depth_colorbar_log,
 )
+from stereo_center.video_compression import (  # noqa: E402
+    compress_preview_video,
+    preview_video_name,
+)
 from stereo_center.orbbec import (  # noqa: E402
     load_pts_us,
     match_left_to_right_pts,
@@ -396,6 +400,12 @@ def main() -> None:
         )
 
     writer.release()
+    t0 = time.time()
+    preview_compression = compress_preview_video(
+        outdir / args.video_name,
+        output_path=outdir / preview_video_name(args.video_name),
+    )
+    t_video_compress = time.time() - t0
     cap.release()
     if cap_right is not None:
         cap_right.release()
@@ -435,6 +445,8 @@ def main() -> None:
         "dmax_m": args.dmax_m,
         "stage_stereo_seconds": round(t_stereo, 2),
         "stage_fusion_seconds": round(t_fusion, 2),
+        "stage_preview_video_compress_seconds": round(t_video_compress, 2),
+        "preview_video_compression": preview_compression,
         "stage_other_seconds": round(max(total_s - t_stereo - t_fusion, 0), 2),
     }
     (outdir / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -455,6 +467,7 @@ def main() -> None:
         "stage_seconds": {
             "stereo_forward_seconds": round(t_stereo, 6),
             "left_depth_or_fusion_seconds": round(t_fusion, 6),
+            "preview_video_compress_seconds": round(t_video_compress, 6),
             "other_seconds": round(max(total_s - t_stereo - t_fusion, 0), 6),
             "total_seconds": round(total_s, 6),
         },

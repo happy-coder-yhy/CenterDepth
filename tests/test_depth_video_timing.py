@@ -3,6 +3,8 @@ import argparse
 import importlib.util
 import os
 import tempfile
+import cv2
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +15,7 @@ spec = importlib.util.spec_from_file_location("run_depth_video", SCRIPT_PATH)
 run_depth_video = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(run_depth_video)
+from stereo_center import video_compression
 
 
 class DepthVideoTimingTests(unittest.TestCase):
@@ -83,8 +86,67 @@ class DepthVideoTimingTests(unittest.TestCase):
         )
 
         self.assertEqual(artifacts["video"], Path("outputs/example/depth_video.mp4"))
+        self.assertEqual(
+            artifacts["preview_video"],
+            Path("outputs/example/depth_video_preview.mp4"),
+        )
         self.assertEqual(artifacts["depth_zarr"], Path("outputs/example/depth.zarr"))
         self.assertNotIn("colorbar", artifacts)
+
+    def test_build_preview_compression_command_preserves_geometry_and_targets_3mbps(self):
+        command = video_compression.build_preview_compression_command(
+            Path("input.mp4"), Path("output.mp4"), 3_000_000,
+            fps="30/1", width=800, height=672,
+        )
+
+        self.assertIn("-c:v", command)
+        self.assertIn("libx264", command)
+        self.assertIn("-b:v", command)
+        self.assertIn("3000k", command)
+        self.assertIn("-r", command)
+        self.assertIn("-s", command)
+        self.assertIn("-fps_mode", command)
+        self.assertIn("cfr", command)
+
+    def test_compress_preview_video_preserves_frame_rate_and_resolution(self):
+        if video_compression.shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "source.mp4"
+            writer = cv2.VideoWriter(
+                str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48)
+            )
+            for index in range(10):
+                writer.write(np.full((48, 64, 3), index * 20, dtype=np.uint8))
+            writer.release()
+
+            metadata = video_compression.compress_preview_video(source)
+
+            self.assertEqual(metadata["width"], 64)
+            self.assertEqual(metadata["height"], 48)
+            self.assertEqual(metadata["fps"], "10/1")
+            self.assertGreater(source.stat().st_size, 0)
+            self.assertFalse((Path(tmpdir) / ".source.compressed.mp4").exists())
+
+    def test_compress_preview_video_can_write_a_second_file_without_replacing_source(self):
+        if video_compression.shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "camera_ego_depth.mp4"
+            preview = Path(tmpdir) / "camera_ego_depth_preview.mp4"
+            writer = cv2.VideoWriter(
+                str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48)
+            )
+            for index in range(3):
+                writer.write(np.full((48, 64, 3), index * 20, dtype=np.uint8))
+            writer.release()
+            source_size = source.stat().st_size
+
+            video_compression.compress_preview_video(source, output_path=preview)
+
+            self.assertEqual(source.stat().st_size, source_size)
+            self.assertTrue(preview.is_file())
+            self.assertGreater(preview.stat().st_size, 0)
 
     def test_stereonet_is_limited_to_left_single_direction_output(self):
         valid = SimpleNamespace(
