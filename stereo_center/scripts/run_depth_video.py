@@ -290,6 +290,85 @@ def validate_waft_temporal_mode(args, hiera_mode: str) -> None:
         )
 
 
+def validate_sea_raft_temporal_mode(args) -> None:
+    """Keep the output-side SEA-RAFT experiment isolated from older filters."""
+    if not args.temporal_sea_raft:
+        return
+    if args.stereo_backend != "ffs":
+        raise ValueError("--temporal-sea-raft currently supports only the FFS backend")
+    if args.output_view != "left" or args.bi:
+        raise ValueError("--temporal-sea-raft requires --output-view left with --bi 0")
+    if args.temporal_raft or args.waft_temporal_init:
+        raise ValueError(
+            "--temporal-sea-raft cannot be combined with RAFT or WAFT temporal modes"
+        )
+    if args.temporal_ema != 1.0 or args.temporal_median != 1:
+        raise ValueError(
+            "--temporal-sea-raft requires --temporal-ema 1 and --temporal-median 1"
+        )
+
+
+def add_sea_raft_temporal_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add opt-in controls for output-side SEA-RAFT temporal fusion."""
+    parser.add_argument(
+        "--temporal-sea-raft", type=int, default=0, choices=[0, 1],
+        help="SEA-RAFT 双向光流对齐历史 FFS 深度，再做弱融合（实验性）",
+    )
+    parser.add_argument(
+        "--sea-raft-root", type=str,
+        default=str(Path.home() / "BothEyesDepth/third_party/SEA-RAFT"),
+        help="固定版本 SEA-RAFT 官方源码根目录",
+    )
+    parser.add_argument(
+        "--sea-raft-weights", type=str,
+        default=str(
+            Path.home()
+            / "BothEyesDepth/models/sea_raft/spring540x960-M/model.safetensors"
+        ),
+        help="SEA-RAFT Spring-M safetensors 权重路径",
+    )
+    parser.add_argument(
+        "--sea-raft-config", type=str, default=None,
+        help="SEA-RAFT JSON 网络配置；默认使用源码中的 config/eval/spring-M.json",
+    )
+    parser.add_argument(
+        "--sea-raft-iters", type=int, default=4,
+        help="SEA-RAFT 迭代次数（Spring-M 默认 4）",
+    )
+    parser.add_argument(
+        "--sea-raft-input-scale", type=float, default=1.0,
+        help="SEA-RAFT 光流输入相对校正图尺寸，首轮建议 1.0",
+    )
+    parser.add_argument(
+        "--sea-raft-max-prior-weight", type=float, default=0.2,
+        help="历史逆深度的最大融合权重",
+    )
+    parser.add_argument(
+        "--sea-raft-photo-tol", type=float, default=25.0,
+        help="SEA-RAFT 时序光度一致性容差（RGB 0-255）",
+    )
+    parser.add_argument(
+        "--sea-raft-flow-abs-tol", type=float, default=0.5,
+        help="SEA-RAFT 前后向光流一致性绝对容差（像素）",
+    )
+    parser.add_argument(
+        "--sea-raft-flow-rel-tol", type=float, default=0.01,
+        help="SEA-RAFT 前后向光流一致性相对容差",
+    )
+    parser.add_argument(
+        "--sea-raft-depth-abs-tol", type=float, default=0.05,
+        help="历史和当前 FFS 深度一致性绝对容差（米）",
+    )
+    parser.add_argument(
+        "--sea-raft-depth-rel-tol", type=float, default=0.05,
+        help="历史和当前 FFS 深度一致性相对容差",
+    )
+    parser.add_argument(
+        "--sea-raft-max-depth", type=float, default=20.0,
+        help="时序先验允许的最大深度（米；<=0 表示不限制）",
+    )
+
+
 def add_waft_temporal_arguments(parser: argparse.ArgumentParser) -> None:
     """Add WAFT warm-start controls without changing the default pipeline."""
     parser.add_argument(
@@ -668,6 +747,7 @@ def main() -> None:
     )
     parser.add_argument("--raft-root", type=str, default=None, help="RAFT 仓库代码根目录")
     add_waft_temporal_arguments(parser)
+    add_sea_raft_temporal_arguments(parser)
     parser.add_argument("--depth-z", type=int, default=1, choices=[0, 1], help="深度 hard z-buffer")
     parser.add_argument(
         "--dmin-m", type=float, default=0.3,
@@ -766,6 +846,7 @@ def main() -> None:
     if hiera_mode == "auto":
         hiera_mode = "hiera" if max(H, W) > 1080 else "direct"
     validate_waft_temporal_mode(args, hiera_mode)
+    validate_sea_raft_temporal_mode(args)
 
     weights_dir = resolve_weights_dir(args.weights, backend)
     print(f"[weights] {weights_dir}")
@@ -820,6 +901,23 @@ def main() -> None:
         t0 = time.perf_counter()
         raft = load_raft(raft_weights, args.raft_root, args.device)
         t_temporal_flow_model_load += time.perf_counter() - t0
+    sea_raft = None
+    t_sea_raft_model_load = 0.0
+    if args.temporal_sea_raft:
+        from stereo_center.sea_raft_flow import load_sea_raft  # noqa: E402
+
+        sea_raft_root = Path(args.sea_raft_root).expanduser().resolve()
+        sea_raft_config = (
+            Path(args.sea_raft_config).expanduser().resolve()
+            if args.sea_raft_config
+            else sea_raft_root / "config/eval/spring-M.json"
+        )
+        t0 = time.perf_counter()
+        sea_raft = load_sea_raft(
+            args.sea_raft_weights, sea_raft_root, sea_raft_config, args.device
+        )
+        synchronize_timing_device(args.device)
+        t_sea_raft_model_load = time.perf_counter() - t0
     temporal_state = {} if args.waft_temporal_init else None
 
     cap = cv2.VideoCapture(args.video)
@@ -898,6 +996,11 @@ def main() -> None:
     prev_depth = None
     prev_left_t = None
     prev_depth_t = None
+    sea_raft_previous = None
+    t_sea_raft_flow = 0.0
+    t_sea_raft_fusion = 0.0
+    sea_raft_accepted_pixels = 0
+    sea_raft_candidate_pixels = 0
     split_left_previous_idx = None
     split_right_previous_idx = None
     split_right_cached = None
@@ -971,7 +1074,7 @@ def main() -> None:
                 l_bgr, r_bgr = img
             bgr_pairs.append(calib.rectify_pair(l_bgr, r_bgr, rect))
         t_rectify += time.perf_counter() - t0
-        dep_b, valid_b, _rgb_b, timing = process_batch(
+        dep_b, valid_b, rgb_b, timing = process_batch(
             model, bgr_pairs, rect, fx, baseline, args,
             temporal_flow_model=raft if args.waft_temporal_init else None,
             temporal_state=temporal_state,
@@ -1013,6 +1116,58 @@ def main() -> None:
             t0 = time.perf_counter()
             d_cur = dep_b[b].unsqueeze(0)  # (1,1,H,W) GPU
             v_cur = valid_b[b].unsqueeze(0)
+            raw_depth = d_cur.detach()
+            if args.temporal_sea_raft and sea_raft is not None:
+                from stereo_center.sea_raft_flow import flow_between as sea_raft_flow_between  # noqa: E402
+                from stereo_center.temporal_depth import fuse_previous_depth  # noqa: E402
+
+                current_rgb = rgb_b[b : b + 1]
+                if sea_raft_previous is not None:
+                    t_sea_t0 = time.perf_counter()
+                    previous_to_current, _ = sea_raft_flow_between(
+                        sea_raft,
+                        sea_raft_previous["rgb"],
+                        current_rgb,
+                        iters=args.sea_raft_iters,
+                        input_scale=args.sea_raft_input_scale,
+                    )
+                    current_to_previous, _ = sea_raft_flow_between(
+                        sea_raft,
+                        current_rgb,
+                        sea_raft_previous["rgb"],
+                        iters=args.sea_raft_iters,
+                        input_scale=args.sea_raft_input_scale,
+                    )
+                    synchronize_timing_device(args.device)
+                    t_sea_raft_flow += time.perf_counter() - t_sea_t0
+                    t_sea_t0 = time.perf_counter()
+                    sea_result = fuse_previous_depth(
+                        d_cur,
+                        sea_raft_previous["depth"],
+                        current_rgb,
+                        sea_raft_previous["rgb"],
+                        previous_to_current,
+                        current_to_previous,
+                        current_valid=v_cur,
+                        previous_valid=sea_raft_previous["valid"],
+                        max_prior_weight=args.sea_raft_max_prior_weight,
+                        photo_tol=args.sea_raft_photo_tol,
+                        flow_abs_tol=args.sea_raft_flow_abs_tol,
+                        flow_rel_tol=args.sea_raft_flow_rel_tol,
+                        depth_abs_tol=args.sea_raft_depth_abs_tol,
+                        depth_rel_tol=args.sea_raft_depth_rel_tol,
+                        max_depth=args.sea_raft_max_depth,
+                    )
+                    d_cur = sea_result.depth
+                    sea_raft_accepted_pixels += int(sea_result.accepted.sum().item())
+                    sea_raft_candidate_pixels += int(sea_result.accepted.numel())
+                    synchronize_timing_device(args.device)
+                    t_sea_raft_fusion += time.perf_counter() - t_sea_t0
+                sea_raft_previous = {
+                    "rgb": current_rgb.detach(),
+                    "depth": raw_depth,
+                    "valid": v_cur.detach(),
+                }
             if win > 1:
                 depth_tbuf.append(d_cur)
                 if len(depth_tbuf) == win:
@@ -1220,6 +1375,25 @@ def main() -> None:
         "n_batches": len(waft_timing_records),
         "model_samples": sum(record["model_samples"] for record in waft_timing_records),
         "waft_temporal_init": bool(args.waft_temporal_init),
+        "temporal_sea_raft": bool(args.temporal_sea_raft),
+        "sea_raft": {
+            "source_root": str(Path(args.sea_raft_root).expanduser()),
+            "weights": str(Path(args.sea_raft_weights).expanduser()),
+            "config": args.sea_raft_config,
+            "iters": args.sea_raft_iters,
+            "input_scale": args.sea_raft_input_scale,
+            "max_prior_weight": args.sea_raft_max_prior_weight,
+            "photo_tol": args.sea_raft_photo_tol,
+            "flow_abs_tol": args.sea_raft_flow_abs_tol,
+            "flow_rel_tol": args.sea_raft_flow_rel_tol,
+            "depth_abs_tol": args.sea_raft_depth_abs_tol,
+            "depth_rel_tol": args.sea_raft_depth_rel_tol,
+            "max_depth": args.sea_raft_max_depth,
+            "accepted_pixel_ratio": (
+                round(sea_raft_accepted_pixels / sea_raft_candidate_pixels, 6)
+                if sea_raft_candidate_pixels else None
+            ),
+        } if args.temporal_sea_raft else None,
         "temporal_valid_ratio": (
             round(temporal_valid_ratio, 6) if temporal_valid_ratio is not None else None
         ),
@@ -1311,6 +1485,27 @@ def main() -> None:
         "temporal_raft": bool(args.temporal_raft),
         "temporal_alpha": args.temporal_alpha,
         "waft_temporal_init": bool(args.waft_temporal_init),
+        "temporal_sea_raft": bool(args.temporal_sea_raft),
+        "sea_raft": {
+            "source_root": str(Path(args.sea_raft_root).expanduser()),
+            "weights": str(Path(args.sea_raft_weights).expanduser()),
+            "config": str(Path(args.sea_raft_config).expanduser())
+            if args.sea_raft_config
+            else str(Path(args.sea_raft_root).expanduser() / "config/eval/spring-M.json"),
+            "iters": args.sea_raft_iters,
+            "input_scale": args.sea_raft_input_scale,
+            "max_prior_weight": args.sea_raft_max_prior_weight,
+            "photo_tol": args.sea_raft_photo_tol,
+            "flow_abs_tol": args.sea_raft_flow_abs_tol,
+            "flow_rel_tol": args.sea_raft_flow_rel_tol,
+            "depth_abs_tol": args.sea_raft_depth_abs_tol,
+            "depth_rel_tol": args.sea_raft_depth_rel_tol,
+            "max_depth": args.sea_raft_max_depth,
+            "accepted_pixel_ratio": (
+                round(sea_raft_accepted_pixels / sea_raft_candidate_pixels, 6)
+                if sea_raft_candidate_pixels else None
+            ),
+        } if args.temporal_sea_raft else None,
         "waft_temporal_flow_iters": args.waft_temporal_flow_iters,
         "waft_temporal_blend": args.waft_temporal_blend,
         "waft_temporal_photo_tol": args.waft_temporal_photo_tol,
@@ -1331,6 +1526,9 @@ def main() -> None:
         "temporal_ema": args.temporal_ema,
         "stage_model_load_seconds": round(t_model_load, 2),
         "stage_temporal_flow_model_load_seconds": round(t_temporal_flow_model_load, 2),
+        "stage_sea_raft_model_load_seconds": round(t_sea_raft_model_load, 2),
+        "stage_sea_raft_flow_seconds": round(t_sea_raft_flow, 2),
+        "stage_sea_raft_fusion_seconds": round(t_sea_raft_fusion, 2),
         "stage_temporal_flow_seconds": round(waft_stage_seconds.get("temporal_flow", 0.0), 2),
         "stage_temporal_initialization_seconds": round(
             waft_stage_seconds.get("temporal_initialization", 0.0), 2
@@ -1379,6 +1577,16 @@ def main() -> None:
     print(f"[timing] 模型加载 {t_model_load:.2f}s")
     if raft is not None:
         print(f"[timing] RAFT 光流模型加载 {t_temporal_flow_model_load:.2f}s")
+    if sea_raft is not None:
+        accepted_ratio = (
+            sea_raft_accepted_pixels / sea_raft_candidate_pixels
+            if sea_raft_candidate_pixels else 0.0
+        )
+        print(f"[timing] SEA-RAFT 模型加载 {t_sea_raft_model_load:.2f}s")
+        print(
+            f"[timing] SEA-RAFT 双向光流 {t_sea_raft_flow:.2f}s，"
+            f"融合 {t_sea_raft_fusion:.2f}s，有效先验比例 {accepted_ratio:.3f}"
+        )
     print(f"[timing] 视频解码与定位 {t_decode:.2f}s")
     print(f"[timing] 双目校正 {t_rectify:.2f}s")
     print(f"[timing] 输入张量准备 {t_input_tensor_prepare:.2f}s")
