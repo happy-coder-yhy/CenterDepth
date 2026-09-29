@@ -35,6 +35,10 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
 from stereo_center.depth_zarr import DepthZarrWriter  # noqa: E402
+from stereo_center.depth_video_visualization import (  # noqa: E402
+    DepthVisualizationCache,
+    render_adaptive_frames,
+)
 from stereo_center.gpu_memory import (  # noqa: E402
     gpu_peak_memory_gib,
     reset_gpu_peak_memory,
@@ -755,7 +759,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--dmax-m", type=float, default=20.0,
-        help="对数米制色阶上限（米，默认 20；超出部分饱和为红色）",
+        help="固定色阶上限 / 自适应色阶的硬上限（米，默认 20；超出部分显示饱和）",
+    )
+    parser.add_argument(
+        "--depth-color-scale", choices=["fixed-log", "sequence-p999"], default="fixed-log",
+        help="fixed-log 保持原色阶；sequence-p999 使用固定 0.3 米下限的对数色阶，"
+        "按全片有效深度 P99.9 选择上限，向上取整到 0.5 米（至少 1 米），"
+        "且不超过 dmax-m；忽略 dmin-m，需临时无损缓存",
     )
     parser.add_argument(
         "--temporal-median", type=int, default=1,
@@ -792,6 +802,10 @@ def main() -> None:
         help="左视角可视化有效掩码：strict=显示严格有效区域；paper=论文/demo式展示预测图，减少黑点",
     )
     args = parser.parse_args()
+    if args.depth_color_scale == "sequence-p999" and (
+        not np.isfinite(args.dmax_m) or args.dmax_m < 1.0
+    ):
+        parser.error("sequence-p999 requires a finite --dmax-m >= 1 meter")
     t_program = time.perf_counter()
     gpu_memory_tracking = reset_gpu_peak_memory(args.device)
 
@@ -988,6 +1002,17 @@ def main() -> None:
         fps,
         (W, H),
     )
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open depth video writer: {artifacts['video']}")
+    color_cache = (
+        DepthVisualizationCache(outdir)
+        if args.depth_color_scale == "sequence-p999" else None
+    )
+    t_adaptive_color = 0.0
+    color_scale_metadata = {
+        "mode": "fixed-log", "mapping": "log", "gamma": 0.6, "colormap": "JET",
+        "dmin_m": args.dmin_m, "dmax_m": args.dmax_m, "fixed_across_frames": True,
+    }
 
     t_all = time.perf_counter()
     depth_tbuf = deque(maxlen=max(1, args.temporal_median))
@@ -1261,14 +1286,19 @@ def main() -> None:
             depth_zarr.append(dep_np)
             t_zarr_write += time.perf_counter() - t0
             t0 = time.perf_counter()
-            depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
-            t_color += time.perf_counter() - t0
+            if color_cache is not None:
+                color_cache.append(dep_np, valid_np, source_frame_indices[b])
+                t_adaptive_color += time.perf_counter() - t0
+            else:
+                depth_img = colorize_depth_log(dep_np, valid_np, args.dmin_m, args.dmax_m)
+                t_color += time.perf_counter() - t0
             t0 = time.perf_counter()
-            writer.write(depth_img)
-            if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
-                t_png0 = time.perf_counter()
-                cv2.imwrite(str(outdir / f"frame_{source_frame_indices[b]:05d}.png"), depth_img)
-                t_png_write += time.perf_counter() - t_png0
+            if color_cache is None:
+                writer.write(depth_img)
+                if args.save_frames_every > 0 and processed % args.save_frames_every == 0:
+                    t_png0 = time.perf_counter()
+                    cv2.imwrite(str(outdir / f"frame_{source_frame_indices[b]:05d}.png"), depth_img)
+                    t_png_write += time.perf_counter() - t_png0
             if args.save_depth_npy:
                 np.save(
                     str(outdir / f"depth_{frame_idx + b:06d}.npy"),
@@ -1287,8 +1317,35 @@ def main() -> None:
                 flush=True,
             )
 
-    writer.release()
+    if color_cache is not None:
+        t0 = time.perf_counter()
+        try:
+            def write_adaptive_frame(index, image):
+                writer.write(image)
+                if args.save_frames_every > 0 and index % args.save_frames_every == 0:
+                    source_index = color_cache.frame_indices[index]
+                    cv2.imwrite(str(outdir / f"frame_{source_index:05d}.png"), image)
+
+            color_scale_metadata = render_adaptive_frames(
+                color_cache.frames, write_adaptive_frame, maximum_m=args.dmax_m
+            )
+            print(
+                f"[color] P99.9={color_scale_metadata['percentile_depth_m']} m, "
+                f"fixed log range=0.3-{color_scale_metadata['dmax_m']:g} m",
+                flush=True,
+            )
+        finally:
+            color_cache.close()
+            writer.release()
+        t_adaptive_color += time.perf_counter() - t0
+    else:
+        writer.release()
+    (outdir / "depth_color_scale.json").write_text(
+        json.dumps(color_scale_metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    t0 = time.perf_counter()
     depth_zarr.close()
+    t_zarr_write += time.perf_counter() - t0
     t0 = time.perf_counter()
     preview_compression = compress_preview_video(
         artifacts["video"], output_path=artifacts["preview_video"]
@@ -1328,6 +1385,7 @@ def main() -> None:
         "left_hole_fill_seconds": t_left_hole_fill,
         "depth_guided_filter_seconds": t_depth_gf,
         "depth_colorize_seconds": t_color,
+        "adaptive_depth_visualization_seconds": t_adaptive_color,
         "video_write_seconds": t_write,
         "depth_zarr_write_seconds": t_zarr_write,
         "preview_video_compress_seconds": t_video_compress,
@@ -1354,6 +1412,7 @@ def main() -> None:
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "preview_video_compression": preview_compression,
         "depth_video_path": args.video_name,
+        "depth_color_scale": color_scale_metadata,
         "depth_preview_video_path": preview_video_name(args.video_name),
         "depth_zarr": {
             "path": "depth.zarr",
@@ -1435,6 +1494,8 @@ def main() -> None:
         json.dumps(stereo_timing, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     stats = {
+        "depth_color_scale": color_scale_metadata,
+        "stage_adaptive_depth_visualization_seconds": round(t_adaptive_color, 6),
         "video": str(args.video),
         "scale": args.scale,
         "batch_size": args.batch_size,
@@ -1519,9 +1580,9 @@ def main() -> None:
         "depth_z": bool(args.depth_z),
         "output_view": args.output_view,
         "left_vis_mode": args.left_vis_mode,
-        "colormap": "log_metric",
-        "dmin_m": args.dmin_m,
-        "dmax_m": args.dmax_m,
+        "colormap": f"{color_scale_metadata['mapping']}_metric",
+        "dmin_m": color_scale_metadata["dmin_m"],
+        "dmax_m": color_scale_metadata["dmax_m"],
         "temporal_median": win,
         "temporal_ema": args.temporal_ema,
         "stage_model_load_seconds": round(t_model_load, 2),
@@ -1609,6 +1670,8 @@ def main() -> None:
     print(f"[timing] 逐帧 GPU 到 CPU 下载 {t_frame_download:.2f}s")
     print(f"[timing] 逐帧 CPU 后处理 {t_frame_cpu_postprocess:.2f}s")
     print(f"[timing] 深度着色 {t_color:.2f}s")
+    if color_cache is not None:
+        print(f"[timing] 自适应色阶缓存、统计及渲染 {t_adaptive_color:.2f}s")
     print(f"[timing] 视频写盘 {t_write:.2f}s（其中 PNG {t_png_write:.2f}s）")
     print(f"[timing] 深度 Zarr 写盘 {t_zarr_write:.2f}s")
     print(
