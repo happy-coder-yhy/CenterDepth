@@ -188,6 +188,17 @@ FFS/TensorRT 推理、视频色阶和视频写入不经过压缩后深度。`--s
 
 - `stereo_center/scripts/validate_depth_storage.py`：对指定深度 Zarr 重新编码并逐像素审计 S 格式，不测量模型真实准确度。
 - `stereo_center/scripts/evaluate_depth_accuracy.py`：对齐后的参考深度、原始预测与解压预测三方比较；支持 `(T,H,W)` NPY、Zarr `depth` 数组或 `depth_*.npy` 目录。
+- `stereo_center/scripts/evaluate_middlebury_storage.py`：使用 Middlebury 全部 15 个 trainingQ 场景和现有 TensorRT engine，比较原始深度及 S1/S2/S3 对公开真值的误差，输出逐场景/分距离指标和静态场景轮播视频。不训练、不改变核心推理配置，Q 原生评测不等于官方全分辨率排行榜。
+
+```bash
+python stereo_center/scripts/evaluate_middlebury_storage.py \
+  --data /path/to/MiddEval3/trainingQ \
+  --engine-dir /path/to/ffs_trt10_orbbec_s05_b12_i5_20260902 \
+  --ffs-root /path/to/Fast-FoundationStereo \
+  --output outputs/middlebury_accuracy
+```
+
+参考图像和 GT 必须来自同一官方 Q 划分。视差转深度使用每场景的 `baseline * fx / (disp + doffs)`，正确处理毫米单位；不得套用奥比相机标定。数据与实验报告不随代码上传。
 
 ## 复现实验建议
 
