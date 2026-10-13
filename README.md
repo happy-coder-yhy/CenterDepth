@@ -188,7 +188,6 @@ FFS/TensorRT 推理、视频色阶和视频写入不经过压缩后深度。`--s
 
 - `stereo_center/scripts/validate_depth_storage.py`：对指定深度 Zarr 重新编码并逐像素审计 S 格式，不测量模型真实准确度。
 - `stereo_center/scripts/evaluate_depth_accuracy.py`：对齐后的参考深度、原始预测与解压预测三方比较；支持 `(T,H,W)` NPY、Zarr `depth` 数组或 `depth_*.npy` 目录。
-- [S 格式接入与精度验证](docs/2026-10-13-S方案接入与深度精度验证.md)：实测大小、格式契约、采集步骤和精度选择方法。
 
 ## 复现实验建议
 
