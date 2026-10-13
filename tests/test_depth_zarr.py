@@ -48,24 +48,24 @@ class DepthZarrWriterTests(unittest.TestCase):
             self.assertEqual(root.attrs["height"], 2)
             self.assertEqual(root.attrs["width"], 3)
             self.assertEqual(root.attrs["backend"], "ffs")
-            self.assertEqual(root.attrs["storage_encoding"], "sz3")
+            self.assertEqual(root.attrs["storage_encoding"], "near_linear_far_log_sz3")
             self.assertEqual(root.attrs["storage_dtype"], "float32")
-            self.assertEqual(root.attrs["absolute_error_tolerance_m"], 0.001)
-            self.assertEqual(root.attrs["error_bound_mode"], "ABS")
-            self.assertEqual(depth.compressor.codec_id, "centerdepth.sz3.v1")
+            self.assertEqual(root.attrs["alpha"], 0.002)
+            self.assertEqual(root.attrs["error_bound_mode"], "PIECEWISE_ABS_REL")
+            self.assertEqual(depth.compressor.codec_id, "centerdepth.log_sz3.v1")
             self.assertFalse(depth.filters)
             self.assertEqual(depth.chunks, (DEPTH_CHUNK_FRAMES, 2, 3))
             self.assertEqual(root.attrs["temporal_chunk_frames"], DEPTH_CHUNK_FRAMES)
 
     def test_each_chunk_is_encoded_once_and_tail_is_flushed_on_close(self):
         import zarr
-        from stereo_center.depth_sz3 import DepthSZ3
+        from stereo_center.depth_sz3 import DepthLogSZ3
 
         frames = np.random.default_rng(4).uniform(0.1, 4, (11, 64, 80)).astype("f4")
         frames[:, 0, 0] = 0
-        encode = DepthSZ3.encode
+        encode = DepthLogSZ3.encode
         with tempfile.TemporaryDirectory() as tmp, patch.object(
-            DepthSZ3, "encode", autospec=True, side_effect=encode
+            DepthLogSZ3, "encode", autospec=True, side_effect=encode
         ) as encoder:
             path = Path(tmp) / "depth.zarr"
             writer = DepthZarrWriter(path, 64, 80, chunk_frames=4)
@@ -81,7 +81,7 @@ class DepthZarrWriterTests(unittest.TestCase):
             decoded = root["depth"][:]
             self.assertEqual(decoded.shape, frames.shape)
             self.assertEqual(root.attrs["n_frames"], len(frames))
-            self.assertLessEqual(float(np.abs(decoded.astype("f8") - frames).max()), 0.001)
+            self.assertTrue((np.abs(decoded.astype("f8") - frames) <= 0.002 * np.maximum(1, frames)).all())
             np.testing.assert_array_equal(decoded == 0, frames == 0)
             with self.assertRaises(RuntimeError):
                 writer.append(frames[0])
@@ -111,7 +111,7 @@ class DepthZarrWriterTests(unittest.TestCase):
                 zarr.open_group(str(path), mode="r")["depth"][0], 1.234, atol=0.001, rtol=0
             )
 
-    def test_normalizes_invalid_depth_and_bounds_error(self):
+    def test_preserves_invalid_and_far_depth_bitwise(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "depth.zarr"
             writer = DepthZarrWriter(path, height=2, width=3)
@@ -128,10 +128,10 @@ class DepthZarrWriterTests(unittest.TestCase):
             depth = zarr.open_group(str(path), mode="r")["depth"][0]
             np.testing.assert_allclose(
                 depth,
-                np.array([[1.2344, 1.2346, 0.0], [0.0, 0.0, 65.4321]], dtype=np.float32),
-                atol=0.001, rtol=0,
+                np.array([[1.2344, 1.2346, np.nan], [np.inf, -1.0, 65.4321]], dtype=np.float32),
+                atol=0.0025, rtol=0,
             )
-            np.testing.assert_array_equal(depth[[0, 1, 1], [2, 0, 1]], 0.0)
+            self.assertEqual(depth[1, 2], np.float32(65.4321))
 
     def test_rejects_wrong_frame_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +139,19 @@ class DepthZarrWriterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 writer.append(np.zeros((3, 2), dtype=np.float32))
             writer.close()
+
+    def test_storage_does_not_change_preview_input(self):
+        from stereo_center.visualize import colorize_depth_log
+
+        frame = np.linspace(0.3, 10, 64 * 80, dtype="f4").reshape(64, 80)
+        valid = frame > 0
+        original = frame.copy()
+        image = colorize_depth_log(frame, valid, 0.3, 20)
+        with tempfile.TemporaryDirectory() as tmp:
+            with DepthZarrWriter(Path(tmp) / "depth.zarr", 64, 80) as writer:
+                writer.append(frame)
+        np.testing.assert_array_equal(frame.view("u4"), original.view("u4"))
+        np.testing.assert_array_equal(colorize_depth_log(frame, valid, 0.3, 20), image)
 
 
 if __name__ == "__main__":

@@ -786,6 +786,8 @@ def main() -> None:
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--save-depth-npy", type=int, default=0, help="每帧额外保存米制深度 npy（供后处理时间平滑）")
+    parser.add_argument("--depth-storage-alpha", type=float, default=0.002,
+                        help="S Zarr error: alpha * max(1,z) meters for 0<z<=10; >10m lossless")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     parser.add_argument(
         "--output-view",
@@ -802,6 +804,8 @@ def main() -> None:
         help="左视角可视化有效掩码：strict=显示严格有效区域；paper=论文/demo式展示预测图，减少黑点",
     )
     args = parser.parse_args()
+    if not np.isfinite(args.depth_storage_alpha) or not 0.0001 <= args.depth_storage_alpha <= 0.1:
+        parser.error("--depth-storage-alpha must be between 0.0001 and 0.1")
     if args.depth_color_scale == "sequence-p999" and (
         not np.isfinite(args.dmax_m) or args.dmax_m < 1.0
     ):
@@ -985,6 +989,7 @@ def main() -> None:
         artifacts["depth_zarr"],
         H,
         W,
+        alpha=args.depth_storage_alpha,
         metadata={
             "fps": float(fps),
             "backend": backend,
@@ -1415,6 +1420,7 @@ def main() -> None:
         "depth_color_scale": color_scale_metadata,
         "depth_preview_video_path": preview_video_name(args.video_name),
         "depth_zarr": {
+            "storage": depth_zarr.storage_metadata,
             "path": "depth.zarr",
             "dataset": "depth",
             "shape": [processed, H, W],
@@ -1510,6 +1516,7 @@ def main() -> None:
         "peak_gpu_memory_gib": peak_gpu_memory_gib,
         "peak_gpu_memory_source": peak_gpu_memory_source,
         "depth_zarr": {
+            "storage": depth_zarr.storage_metadata,
             "path": "depth.zarr",
             "dataset": "depth",
             "shape": [processed, H, W],

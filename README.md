@@ -154,7 +154,7 @@ FFS 可选 `triton` 代价体后端。以下命令使用此前实验中验证过
 | 文件 | 说明 |
 | --- | --- |
 | `depth_video.mp4` | 深度着色视频；默认使用全片固定的对数米制色阶。 |
-| `colorbar.png` | 深度视频对应的颜色标尺。 |
+| `depth.zarr` | 米制 float32 深度，S 格式（近段线性、远段对数 + SZ3），默认逐帧块。 |
 | `stats.json` | 端到端实验配置、逐阶段耗时、平均每帧耗时和峰值显存。 |
 | `<backend>_timing.json` | 后端专属的逐批次推理时间，例如 `waft_timing.json`、`ffs_timing.json`。 |
 | `frame_*.png` | 仅在 `--save-frames-every` 大于 0 时输出的采样帧。 |
@@ -167,6 +167,28 @@ FFS 可选 `triton` 代价体后端。以下命令使用此前实验中验证过
 - `peak_gpu_memory_gib`：PyTorch 记录的峰值保留显存，单位 GiB。
 - `stage_stereo_forward_seconds`：模型前向耗时。
 - `stage_stereo_pipeline_seconds`：模型输入准备、前向和输出处理总耗时。
+
+## 深度序列存储
+
+默认 S 格式保持 `depth[T,H,W]` 的米制 float32 读取接口。`0 < z <= 1 m` 使用线性变换，`1 < z <= 10 m` 使用 `1 + ln(z)`；变换后由 SZ3 压缩。大于 10 m、非正值和非有限值逐位无损保留。导入 codec 后，Zarr 会自动反变换，调用方不要再次取指数。
+
+```python
+import stereo_center.depth_sz3  # 注册新旧 codec；PYTHONPATH 指向项目的 stereo_center 目录
+import zarr
+
+depth = zarr.open_group("outputs/run/depth.zarr", mode="r")["depth"]
+frame_m = depth[0]
+```
+
+依赖 `zarr<3`、`numcodecs`、`pysz==1.0.3`。新 codec ID 为 `centerdepth.log_sz3.v1`；旧 `centerdepth.sz3.v1` 仍可读取。旧版本读者必须更新 codec 模块后才能读取新数据。
+
+推理参数 `--depth-storage-alpha 0.002` 控制误差上限 `alpha * max(1,z)` m，仅应用于 `0 < z <= 10 m`。默认意味着近场最多 2 mm、远场最多 0.2%，不是全距离 2 mm，也不是无损 float32。格式已确定，精度档位可配置，仍需独立真值评估下游容限。
+
+FFS/TensorRT 推理、视频色阶和视频写入不经过压缩后深度。`--save-depth-npy 1` 可额外保存压缩前逐帧深度，供准确度评估。不要把已损失的信息误认为解压后能够恢复。
+
+- `stereo_center/scripts/validate_depth_storage.py`：对指定深度 Zarr 重新编码并逐像素审计 S 格式，不测量模型真实准确度。
+- `stereo_center/scripts/evaluate_depth_accuracy.py`：对齐后的参考深度、原始预测与解压预测三方比较；支持 `(T,H,W)` NPY、Zarr `depth` 数组或 `depth_*.npy` 目录。
+- [S 格式接入与精度验证](docs/2026-10-13-S方案接入与深度精度验证.md)：实测大小、格式契约、采集步骤和精度选择方法。
 
 ## 复现实验建议
 

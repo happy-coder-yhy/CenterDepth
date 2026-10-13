@@ -8,8 +8,8 @@ from typing import Mapping
 import numpy as np
 
 
-DEPTH_ABSOLUTE_ERROR_METER = 0.001
-DEPTH_CHUNK_FRAMES = 32
+DEPTH_STORAGE_ALPHA = 0.002
+DEPTH_CHUNK_FRAMES = 1
 
 
 class DepthZarrWriter:
@@ -27,11 +27,12 @@ class DepthZarrWriter:
         metadata: Mapping[str, object] | None = None,
         *,
         chunk_frames: int = DEPTH_CHUNK_FRAMES,
+        alpha: float = DEPTH_STORAGE_ALPHA,
     ) -> None:
         try:
             import zarr
             import pysz  # noqa: F401
-            from .depth_sz3 import DepthSZ3
+            from .depth_sz3 import DepthLogSZ3
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ImportError(
                 "Zarr output requires `zarr<3`, `numcodecs` and `pysz==1.0.3`; "
@@ -55,18 +56,18 @@ class DepthZarrWriter:
         self._buffer_count = 0
         self._written_frames = 0
         self._closed = False
+        codec = DepthLogSZ3((self.chunk_frames, self.height, self.width), alpha)
         self._root = zarr.open_group(str(self.path), mode="w")
         self._depth = self._root.create_dataset(
             "depth",
             shape=(0, self.height, self.width),
             chunks=(self.chunk_frames, self.height, self.width),
             dtype="f4",
-            compressor=DepthSZ3(
-                shape=(self.chunk_frames, self.height, self.width),
-                tolerance=DEPTH_ABSOLUTE_ERROR_METER,
-            ),
+            compressor=codec,
         )
         attrs = dict(metadata or {})
+        attrs.pop("absolute_error_tolerance_m", None)
+        attrs.pop("invalid_depth_value", None)
         attrs.update(
             {
                 "n_frames": 0,
@@ -74,19 +75,29 @@ class DepthZarrWriter:
                 "width": self.width,
                 "dtype": "float32",
                 "depth_unit": "meter",
-                "storage_encoding": "sz3",
+                "storage_encoding": "near_linear_far_log_sz3",
                 "storage_dtype": "float32",
-                "error_bound_mode": "ABS",
-                "absolute_error_tolerance_m": DEPTH_ABSOLUTE_ERROR_METER,
-                "codec_id": DepthSZ3.codec_id,
+                "error_bound_mode": "PIECEWISE_ABS_REL",
+                "alpha": codec.alpha,
+                "error_bound_m": "alpha * max(1, z) for 0 < z <= 10 m",
+                "split_depth_m": 1.0,
+                "lossy_max_depth_m": 10.0,
+                "transform": "z if z <= 1 else 1 + ln(z), z in meters",
+                "transform_abs_tolerance": float(codec.transform_tolerance),
+                "far_depth_policy": "bitwise_lossless_above_10m",
+                "invalid_depth_policy": "bitwise_preserve_nonpositive_and_nonfinite",
+                "codec_id": codec.codec_id,
                 "reader_requirement": "pysz and import stereo_center.depth_sz3",
-                "invalid_depth_value": 0.0,
                 "compression_axes": ["time", "height", "width"],
                 "temporal_chunk_frames": self.chunk_frames,
                 "partial_chunk_padding": "zero; excluded from array shape",
             }
         )
         self._root.attrs.update(attrs)
+
+    @property
+    def storage_metadata(self) -> dict:
+        return dict(self._root.attrs)
 
     @property
     def n_frames(self) -> int:
@@ -99,8 +110,6 @@ class DepthZarrWriter:
         expected = (self.height, self.width)
         if depth.shape != expected:
             raise ValueError(f"Depth frame must have shape {expected}, got {depth.shape}")
-        np.nan_to_num(depth, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        np.maximum(depth, 0.0, out=depth)
         self._buffer[self._buffer_count] = depth
         self._buffer_count += 1
         if self._buffer_count == self.chunk_frames:
