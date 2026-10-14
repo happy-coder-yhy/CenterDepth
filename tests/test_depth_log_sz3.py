@@ -74,7 +74,7 @@ class DepthLogSZ3Tests(unittest.TestCase):
                             str(Path(__file__).resolve().parents[1] / "stereo_center"), str(path)], check=True)
             result = zarr.open_group(str(path), mode="r")["depth"][1:5:2, 2:7, 3:9]
             source = frames[1:5:2, 2:7, 3:9]
-            self.assertTrue((np.abs(result.astype("f8") - source) <= 0.002 * np.maximum(1, source)).all())
+            self.assertTrue((np.abs(result.astype("f8") - source) <= 0.001 * np.maximum(1, source.astype("f8"))).all())
 
 
 if __name__ == "__main__":

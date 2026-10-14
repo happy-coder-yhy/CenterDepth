@@ -1,4 +1,7 @@
 .venv/
+.venv-*/
+.pytest_cache/
+*.egg-info/
 .idea/
 .DS_Store
 docs/

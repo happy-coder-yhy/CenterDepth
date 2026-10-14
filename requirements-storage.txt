@@ -1,0 +1,4 @@
+# Keep the existing inference runtime on NumPy 1.x.
+numpy>=1.26,<2
+# Standalone S1 codec release v0.1.0; pinned for reproducible storage behavior.
+zpds-depth-cp @ git+https://github.com/happy-coder-yhy/zpds-depth-cp.git@e4085c113eea8f4c53711a304dbf437b6898be95

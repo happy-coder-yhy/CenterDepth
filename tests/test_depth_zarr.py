@@ -50,7 +50,7 @@ class DepthZarrWriterTests(unittest.TestCase):
             self.assertEqual(root.attrs["backend"], "ffs")
             self.assertEqual(root.attrs["storage_encoding"], "near_linear_far_log_sz3")
             self.assertEqual(root.attrs["storage_dtype"], "float32")
-            self.assertEqual(root.attrs["alpha"], 0.002)
+            self.assertEqual(root.attrs["alpha"], 0.001)
             self.assertEqual(root.attrs["error_bound_mode"], "PIECEWISE_ABS_REL")
             self.assertEqual(depth.compressor.codec_id, "centerdepth.log_sz3.v1")
             self.assertFalse(depth.filters)
@@ -81,7 +81,7 @@ class DepthZarrWriterTests(unittest.TestCase):
             decoded = root["depth"][:]
             self.assertEqual(decoded.shape, frames.shape)
             self.assertEqual(root.attrs["n_frames"], len(frames))
-            self.assertTrue((np.abs(decoded.astype("f8") - frames) <= 0.002 * np.maximum(1, frames)).all())
+            self.assertTrue((np.abs(decoded.astype("f8") - frames) <= 0.001 * np.maximum(1, frames.astype("f8"))).all())
             np.testing.assert_array_equal(decoded == 0, frames == 0)
             with self.assertRaises(RuntimeError):
                 writer.append(frames[0])

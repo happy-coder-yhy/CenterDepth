@@ -34,7 +34,7 @@ for _p in (PROJECT_ROOT, PROJECT_ROOT / "third_party/s2m2/src"):
         sys.path.insert(0, str(_p))
 
 from stereo_center import calib, softsplat, stereo_backend  # noqa: E402
-from stereo_center.depth_zarr import DepthZarrWriter  # noqa: E402
+from stereo_center.depth_zarr import DEPTH_STORAGE_ALPHA, DepthZarrWriter  # noqa: E402
 from stereo_center.depth_video_visualization import (  # noqa: E402
     DepthVisualizationCache,
     render_adaptive_frames,
@@ -786,7 +786,7 @@ def main() -> None:
     )
     parser.add_argument("--save-frames-every", type=int, default=50, help="每隔 N 帧存一张深度 PNG（0=不存）")
     parser.add_argument("--save-depth-npy", type=int, default=0, help="每帧额外保存米制深度 npy（供后处理时间平滑）")
-    parser.add_argument("--depth-storage-alpha", type=float, default=0.002,
+    parser.add_argument("--depth-storage-alpha", type=float, default=DEPTH_STORAGE_ALPHA,
                         help="S Zarr error: alpha * max(1,z) meters for 0<z<=10; >10m lossless")
     parser.add_argument("--video-name", type=str, default="depth_video.mp4")
     parser.add_argument(

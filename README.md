@@ -170,7 +170,13 @@ FFS 可选 `triton` 代价体后端。以下命令使用此前实验中验证过
 
 ## 深度序列存储
 
-默认 S 格式保持 `depth[T,H,W]` 的米制 float32 读取接口。`0 < z <= 1 m` 使用线性变换，`1 < z <= 10 m` 使用 `1 + ln(z)`；变换后由 SZ3 压缩。大于 10 m、非正值和非有限值逐位无损保留。导入 codec 后，Zarr 会自动反变换，调用方不要再次取指数。
+默认采用 **S1/T1**，编解码统一由独立工具 [zpds-depth-cp](https://github.com/happy-coder-yhy/zpds-depth-cp) 维护，本仓库保留兼容导入接口。先安装存储依赖：
+
+```bash
+python -m pip install -r requirements-storage.txt
+```
+
+S 格式保持 `depth[T,H,W]` 的米制 float32 读取接口。`0 < z <= 1 m` 使用线性变换，`1 < z <= 10 m` 使用 `1 + ln(z)`；变换后由 SZ3 压缩。大于 10 m、非正值和非有限值逐位无损保留。导入 codec 后，Zarr 会自动反变换，调用方不要再次取指数。
 
 ```python
 import stereo_center.depth_sz3  # 注册新旧 codec；PYTHONPATH 指向项目的 stereo_center 目录
@@ -180,25 +186,21 @@ depth = zarr.open_group("outputs/run/depth.zarr", mode="r")["depth"]
 frame_m = depth[0]
 ```
 
-依赖 `zarr<3`、`numcodecs`、`pysz==1.0.3`。新 codec ID 为 `centerdepth.log_sz3.v1`；旧 `centerdepth.sz3.v1` 仍可读取。旧版本读者必须更新 codec 模块后才能读取新数据。
+独立包声明兼容的 Zarr v2、Numcodecs 和 PySZ 依赖。新 codec ID 为 `centerdepth.log_sz3.v1`；旧 `centerdepth.sz3.v1` 仍可读取。旧 S 数据按文件中的 alpha 解码，不会因默认值改变而被重新压缩。新输出目录中的 `depth.zarr` 必须不存在，避免误覆盖。
 
-推理参数 `--depth-storage-alpha 0.002` 控制误差上限 `alpha * max(1,z)` m，仅应用于 `0 < z <= 10 m`。默认意味着近场最多 2 mm、远场最多 0.2%，不是全距离 2 mm，也不是无损 float32。格式已确定，精度档位可配置，仍需独立真值评估下游容限。
+推理参数 `--depth-storage-alpha` 默认 **0.001（S1）**，控制误差上限 `alpha * max(1,z)` m，仅应用于 `0 < z <= 10 m`。近场最多 1 mm、远场最多 0.1%，不是全距离 1 mm，也不是无损 float32。该上限相对于压缩前预测，不是模型对真值的准确率。
 
 FFS/TensorRT 推理、视频色阶和视频写入不经过压缩后深度。`--save-depth-npy 1` 可额外保存压缩前逐帧深度，供准确度评估。不要把已损失的信息误认为解压后能够恢复。
 
-- `stereo_center/scripts/validate_depth_storage.py`：对指定深度 Zarr 重新编码并逐像素审计 S 格式，不测量模型真实准确度。
-- `stereo_center/scripts/evaluate_depth_accuracy.py`：对齐后的参考深度、原始预测与解压预测三方比较；支持 `(T,H,W)` NPY、Zarr `depth` 数组或 `depth_*.npy` 目录。
-- `stereo_center/scripts/evaluate_middlebury_storage.py`：使用 Middlebury 全部 15 个 trainingQ 场景和现有 TensorRT engine，比较原始深度及 S1/S2/S3 对公开真值的误差，输出逐场景/分距离指标和静态场景轮播视频。不训练、不改变核心推理配置，Q 原生评测不等于官方全分辨率排行榜。
+独立文件压缩、解压和存储误差校验：
 
 ```bash
-python stereo_center/scripts/evaluate_middlebury_storage.py \
-  --data /path/to/MiddEval3/trainingQ \
-  --engine-dir /path/to/ffs_trt10_orbbec_s05_b12_i5_20260902 \
-  --ffs-root /path/to/Fast-FoundationStereo \
-  --output outputs/middlebury_accuracy
+zpds-depth-cp compress original_depth.npy depth.zarr
+zpds-depth-cp decompress depth.zarr decoded_depth.npy
+zpds-depth-cp verify original_depth.npy depth.zarr
 ```
 
-参考图像和 GT 必须来自同一官方 Q 划分。视差转深度使用每场景的 `baseline * fx / (disp + doffs)`，正确处理毫米单位；不得套用奥比相机标定。数据与实验报告不随代码上传。
+输入 NPY 为米制 float32 的 `(H,W)` 或 `(T,H,W)` 数组；不支持把着色 MP4 当作数值深度。历史独立评测脚本已移除，保留推理管线和功能回归测试。数据与实验报告不随代码上传。
 
 ## 复现实验建议
 
